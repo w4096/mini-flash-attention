@@ -1,0 +1,19 @@
+BasedOnStyle: LLVM
+---
+Language: Cpp
+ColumnLimit: 120
+Standard: c++20
+IndentWidth: 4
+IndentAccessModifiers: false
+AccessModifierOffset: -3
+KeepEmptyLinesAtTheStartOfBlocks: false
+SpaceAfterTemplateKeyword: false
+SortIncludes: CaseSensitive
+PointerAlignment: Left
+ReferenceAlignment: Left
+AlignAfterOpenBracket: Align
+AllowShortFunctionsOnASingleLine: Empty
+AlignArrayOfStructures: Left
+AllowShortLambdasOnASingleLine: Empty
+BreakConstructorInitializers: BeforeColon
+AlwaysBreakTemplateDeclarations: Yes
