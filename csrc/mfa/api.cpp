@@ -40,23 +40,26 @@ void forward_params_init(ForwardParams& params, torch::Tensor q, torch::Tensor k
     params.v_batch_stride = v.stride(-4);
     params.o_batch_stride = o.stride(-4);
 
-    params.heads = static_cast<int>(q.size(-3));
-    params.kv_heads = static_cast<int>(k.size(-3));
+    params.heads = static_cast<int>(q.size(-2));
+    params.kv_heads = static_cast<int>(k.size(-2));
     params.kv_group_size = params.heads / params.kv_heads;
-    params.q_head_stride = q.stride(-3);
-    params.k_head_stride = k.stride(-3);
-    params.v_head_stride = v.stride(-3);
-    params.o_head_stride = o.stride(-3);
+    params.q_head_stride = q.stride(-2);
+    params.k_head_stride = k.stride(-2);
+    params.v_head_stride = v.stride(-2);
+    params.o_head_stride = o.stride(-2);
 
-    params.seqlen_q = static_cast<int>(q.size(-2));
-    params.seqlen_k = static_cast<int>(k.size(-2));
-    params.q_row_stride = q.stride(-2);
-    params.k_row_stride = k.stride(-2);
-    params.v_row_stride = v.stride(-2);
-    params.o_row_stride = o.stride(-2);
+    params.seqlen_q = static_cast<int>(q.size(-3));
+    params.seqlen_k = static_cast<int>(k.size(-3));
+    params.q_row_stride = q.stride(-3);
+    params.k_row_stride = k.stride(-3);
+    params.v_row_stride = v.stride(-3);
+    params.o_row_stride = o.stride(-3);
 
     params.head_dim = static_cast<int>(q.size(-1));
     params.softmax_scale = 1.0f / std::sqrt(static_cast<float>(params.head_dim));
+    params.softmax_scale_log2 = params.softmax_scale * M_LOG2E;
+
+    params.is_bf16 = q.dtype() == torch::kBFloat16;
 }
 
 /**
@@ -65,7 +68,7 @@ void forward_params_init(ForwardParams& params, torch::Tensor q, torch::Tensor k
  * @param q  total_q x num_heads x head_size
  * @param k  total_k x num_heads_k x head_size
  * @param v  total_k x num_heads_k x head_size
- * @return
+ * @return 
  */
 std::vector<at::Tensor> flash_attention_v2(const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v) {
     torch::cuda::CUDAGuard guard(q.device());
@@ -85,6 +88,7 @@ std::vector<at::Tensor> flash_attention_v2(const torch::Tensor& q, const torch::
     TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
 
     torch::Tensor out = torch::empty_like(q);
+    torch::Tensor lse;  // TODO
 
     ForwardParams params{};
     forward_params_init(params, q, k, v, out);
@@ -93,7 +97,7 @@ std::vector<at::Tensor> flash_attention_v2(const torch::Tensor& q, const torch::
     run_flash_attention_forward(params, stream);
     torch::cuda::stream_synchronize(stream);
 
-    return {out};
+    return {out, lse};
 }
 
 } // namespace mfa

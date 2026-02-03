@@ -12,8 +12,10 @@ void run_mha_fwd(ForwardParams &params, cudaStream_t stream) {
 }
 
 void run_flash_attention_forward(ForwardParams& params, cudaStream_t stream) {
-    HEAD_DIM_SWITCH(params.head_dim, [&] {
-        run_mha_fwd<cutlass::half_t, kHeadDim>(params, stream);
+    FP16_SWITCH(!params.is_bf16, [&] {
+        HEAD_DIM_SWITCH(params.head_dim, [&] {
+            run_mha_fwd<elem_type, kHeadDim>(params, stream);
+        });
     });
 }
 

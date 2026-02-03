@@ -39,9 +39,16 @@ ext_modules = [
             ],
             'nvcc': [
                 '-std=c++20',
+                '-O3',
                 "--generate-line-info",
                 "--use_fast_math",
                 "-Xptxas=-warn-spills",
+                "-U__CUDA_NO_HALF_OPERATORS__",
+                "-U__CUDA_NO_HALF_CONVERSIONS__",
+                "-U__CUDA_NO_HALF2_OPERATORS__",
+                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                "--expt-relaxed-constexpr",
+                "--expt-extended-lambda",
             ],
         })
 ]
