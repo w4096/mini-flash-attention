@@ -2,6 +2,6 @@
 #include <torch/python.h>
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "MiniFlashAttention";
-    m.def("flash_attention_v2", &mfa::flash_attention_v2, "Forward pass");
+    m.doc() = "mini flash attention";
+    m.def("mini_flash_attention_forward", &mfa::flash_attention_forward, "Forward pass");
 }

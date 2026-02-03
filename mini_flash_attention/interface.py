@@ -1,40 +1,31 @@
-from typing import Optional, Tuple
-
+from typing import List, Tuple
 import torch
-import mini_flash_attention._C as mini_flash_attn
+import mini_flash_attention._C as _C  # type: ignore[import-not-found]
 
 
-@torch.library.custom_op("mini_flash_attn::_flash_attn_forward", mutates_args=(), device_types="cuda")
-def _flash_attn_forward(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    out, softmax_lse = mini_flash_attn.flash_attention_v2(q, k, v)
-    return out, softmax_lse
-
-
-wrapped_flash_attn_forward = torch.ops.mini_flash_attn._flash_attn_forward
-
-def mini_flash_attn_func(
-        q,
-        k,
-        v,
-):
+def flash_attn_func(
+    q: torch.Tensor,
+    k: torch.Tensor, 
+    v: torch.Tensor,
+) -> torch.Tensor:
     """
-    Arguments:
-        q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
-        k: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
-        v: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
-    Return:
-        out: (total, nheads, headdim).
-        softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
-            logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
-            normalization factor).
+    Mini Flash Attention forward pass.
+    
+    Args:
+        q: Query tensor (batch, seqlen_q, heads, head_dim)
+        k: Key tensor (batch, seqlen_k, heads_k, head_dim)
+        v: Value tensor (batch, seqlen_k, heads_k, head_dim)
+    
+    Returns:
+        Output tensor (batch, seqlen_q, heads, head_dim)
+    
+    Example:
+        >>> q = torch.randn(1, 4096, 8, 128, device='cuda', dtype=torch.float16)
+        >>> k = torch.randn(1, 4096, 8, 128, device='cuda', dtype=torch.float16)
+        >>> v = torch.randn(1, 4096, 8, 128, device='cuda', dtype=torch.float16)
+        >>> out = flash_attn_func(q, k, v)
     """
-    return wrapped_flash_attn_forward(
-        q,
-        k,
-        v,
-    )
+    result: List[torch.Tensor] = _C.mini_flash_attention_forward(q, k, v)
+    return result[0]
+
 

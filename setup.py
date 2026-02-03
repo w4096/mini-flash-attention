@@ -58,6 +58,9 @@ if __name__ == '__main__':
         name='mini_flash_attention',
         version='0.1.0',
         packages=setuptools.find_packages('.'),
+        package_data={
+            'mini_flash_attention': ['*.pyi', 'py.typed'],
+        },
         zip_safe=False,
         ext_modules=ext_modules,
         cmdclass={'build_ext': BuildExtension},

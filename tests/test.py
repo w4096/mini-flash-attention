@@ -1,7 +1,7 @@
 import math
 
 import torch
-from mini_flash_attention import mini_flash_attn_func
+from mini_flash_attention import flash_attn_func as mini_flash_attn_func
 from flash_attn import flash_attn_func
 
 def flash_attention(q, k, v):
@@ -9,25 +9,16 @@ def flash_attention(q, k, v):
 
 
 def torch_attention(q, k, v):
-    # Scaled dot-product attention
-    dtype = q.dtype
-    d_k = q.size(-1)
-    
-    q = q.to(torch.float32)
-    k = k.to(torch.float32)
-    v = v.to(torch.float32)
-
     q = q.transpose(1, 2)
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)
     
-    scores = torch.matmul(q, k.transpose(-2, -1))
-    attn = torch.softmax(scores / math.sqrt(d_k), dim=-1)
-    output = torch.matmul(attn, v)
-    return output.transpose(1, 2).to(dtype)
+    o = torch.nn.functional.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+    return o.transpose(1, 2)
 
 def mini_flash_attention(q, k, v):
-    return mini_flash_attn_func(q, k, v)[0]
+    # 新的接口直接返回 Tensor，不再返回 tuple
+    return mini_flash_attn_func(q, k, v)
     
 def test_flash_attn_forward():
 

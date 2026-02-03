@@ -70,7 +70,7 @@ void forward_params_init(ForwardParams& params, torch::Tensor q, torch::Tensor k
  * @param v  total_k x num_heads_k x head_size
  * @return 
  */
-std::vector<at::Tensor> flash_attention_v2(const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v) {
+std::vector<at::Tensor> flash_attention_forward(const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v) {
     torch::cuda::CUDAGuard guard(q.device());
 
     auto dtype = q.dtype();

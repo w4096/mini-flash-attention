@@ -3,4 +3,4 @@ build/
 cmake-build-debug/
 /.vscode/
 __pycache__/
-__pycache__/
+tmp/
