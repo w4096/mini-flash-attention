@@ -64,45 +64,39 @@ output = mini_flash_attn_func(q, k, v)[0]
 
 ## Performance
 
-Tested on NVIDIA GPU with sequence length 4096, head dimension 128:
+Benchmarked on NVIDIA GPU with the following configuration:
+
+| Parameter | Value |
+|-----------|-------|
+| Batch Size | 10 |
+| Sequence Length | 4096 |
+| Head Dimension | 128 |
+| Number of Heads | 28 |
+
+by running the benchmark script in `benchmark/run.py`.
+
+### Timing Results
+
+| Implementation | CPU Time | CUDA Time |
+|----------------|----------|-----------|
+| **Mini Flash Attention** | 41.606ms | **41.547ms** |
+| PyTorch Attention | 44.098ms | 42.882ms |
+| Flash Attention (official) | 43.890ms | 42.692ms |
+
+### Accuracy Comparison
+
+All implementations produce nearly identical results:
 
 ```
-Mini Flash Attention Profiling Results:
--------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
--------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-                   mini_flash_attn::_flash_attn_forward         3.46%     108.825us        99.94%       3.144ms       3.144ms     654.799us       100.00%       3.274ms       3.274ms             1  
-                                       cudaLaunchKernel         0.92%      28.948us        41.64%       1.310ms       1.310ms       0.000us         0.00%       1.964ms       1.964ms             1  
-                       Runtime Triggered Module Loading        40.23%       1.265ms        40.23%       1.265ms     632.710us       1.310ms       200.00%       1.310ms     654.799us             2  
-                                Activity Buffer Request        33.24%       1.046ms        33.24%       1.046ms       1.046ms     654.799us       100.00%     654.799us     654.799us             1  
-                                  Lazy Function Loading         0.50%      15.577us         0.50%      15.577us      15.577us     654.799us       100.00%     654.799us     654.799us             1  
-void mfa::flash_attention_fwd_kernel<mfa::ForwardKer...         0.00%       0.000us         0.00%       0.000us       0.000us     654.799us       100.00%     654.799us     654.799us             1  
-                                       aten::empty_like         0.29%       9.278us         0.81%      25.564us      25.564us       0.000us         0.00%       0.000us       0.000us             1  
-                                    aten::empty_strided         0.52%      16.286us         0.52%      16.286us      16.286us       0.000us         0.00%       0.000us       0.000us             1  
-                                  cudaStreamSynchronize        20.78%     653.650us        20.78%     653.650us     653.650us       0.000us         0.00%       0.000us       0.000us             1  
-                                  cudaDeviceSynchronize         0.06%       1.963us         0.06%       1.963us       1.963us       0.000us         0.00%       0.000us       0.000us             1  
--------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-Self CPU time total: 3.146ms
-Self CUDA time total: 654.799us
-
-Flash Attention Profiling Results:
--------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
--------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-                                          FlashAttnFunc         1.65%      68.555us        82.29%       3.414ms       3.414ms       0.000us         0.00%       3.310ms       3.310ms             1  
-                        flash_attn::_flash_attn_forward         7.31%     303.449us        80.40%       3.336ms       3.336ms     827.467us       100.00%       3.310ms       3.310ms             1  
-                                   cudaFuncSetAttribute         4.98%     206.744us        50.03%       2.076ms       2.076ms       0.000us         0.00%       1.655ms       1.655ms             1  
-                                Activity Buffer Request        22.29%     925.022us        22.29%     925.022us     925.022us     827.467us       100.00%     827.467us     827.467us             1  
-                       Runtime Triggered Module Loading        42.44%       1.761ms        42.44%       1.761ms       1.761ms     827.467us       100.00%     827.467us     827.467us             1  
-                                  Lazy Function Loading         2.60%     108.038us         2.60%     108.038us     108.038us     827.467us       100.00%     827.467us     827.467us             1  
-void flash::flash_fwd_kernel<Flash_fwd_kernel_traits...         0.00%       0.000us         0.00%       0.000us       0.000us     827.467us       100.00%     827.467us     827.467us             1  
-                                 cudaDeviceGetAttribute         0.01%       0.598us         0.01%       0.598us       0.120us       0.000us         0.00%       0.000us       0.000us             5  
-                                       aten::empty_like         0.09%       3.741us         0.32%      13.271us      13.271us       0.000us         0.00%       0.000us       0.000us             1  
-                                    aten::empty_strided         0.23%       9.530us         0.23%       9.530us       9.530us       0.000us         0.00%       0.000us       0.000us             1  
--------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-Self CPU time total: 4.149ms
-Self CUDA time total: 827.467us
+Max difference between mini-flash-attn and flash-attn: 3.814697265625e-06
+Max difference between torch and flash-attn: 3.814697265625e-06
+Max difference between torch and mini-flash-attn: 3.814697265625e-06
 ```
+
+**Key Takeaways:**
+- Mini Flash Attention achieves **competitive performance** with the official implementation
+- Numerical accuracy is within expected FP16 precision bounds
+- ~6% speedup compared to standard PyTorch attention
 
 ## Technical Details
 
@@ -159,16 +153,6 @@ mini-flash-attention/
 - **Compute Capability**: Requires SM 8.0+ (Ampere architecture or newer)
 - **GQA/MQA**: Grouped-query attention support is basic
 
-## Accuracy Notes
-
-The implementation achieves ~1e-3 maximum absolute error compared to the reference PyTorch implementation when using FP16. This is within the expected numerical precision for half-precision floating-point operations:
-
-- FP16 mantissa precision: ~3 decimal digits (ε ≈ 0.001)
-- Error sources: fp16 conversion of softmax weights, cumulative rounding in long sequences
-- Mitigation: Uses FMA instructions and careful online softmax rescaling
-
-For applications requiring higher precision, consider using the official Flash Attention implementation or adjusting the kernel to use higher intermediate precision.
-
 ## Development
 
 ### Running Tests
@@ -187,9 +171,9 @@ python setup.py build --debug
 
 Contributions are welcome! Areas for improvement:
 
-- [ ] Implement causal masking
-- [ ] Add backward pass
+- [x] Implement causal masking
 - [ ] Support variable sequence lengths
+- [ ] Support KV cache
 - [ ] Add more kernel configurations for different head dimensions
 
 ## References

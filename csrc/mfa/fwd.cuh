@@ -90,7 +90,7 @@ class Key {
     }
 
     __device__ void copy_gmem_to_smem() {
-        for (unsigned int i = 0; i < size(smem_); i += blockDim.x * 8) {
+        for (unsigned int i = 0; i < size(smem_); i += KernelTraits::kBlockSize * 8) {
             auto idx = i + threadIdx.x * 8;
             auto row = idx / size<1>(smem_);
             auto col = idx % size<1>(smem_);
@@ -143,7 +143,7 @@ struct Value {
     }
 
     __device__ void copy_gmem_to_smem() {
-        for (unsigned int i = 0; i < size(smem_); i += blockDim.x * 8) {
+        for (unsigned int i = 0; i < size(smem_); i += KernelTraits::kBlockSize * 8) {
             auto idx = i + threadIdx.x * 8;
             auto row = idx / size<1>(smem_);
             auto col = idx % size<1>(smem_);
@@ -224,7 +224,7 @@ class Score {
 
                 // Perform MMA operation
                 // clang-format off
-                KernelTraits::MMA::fma(
+                KernelTraits::MMA::fma( 
                     c0, c1, c2, c3,
                     a0, a1, a2, a3,
                     b0, b1,
@@ -262,6 +262,37 @@ class Score {
 
     __device__ __forceinline__ ElementAccum& operator()(int n, int idx) {
         return score_(n, idx);
+    }
+
+    // Set causal mask: set scores to -inf where col_idx > row_idx
+    __device__ void set_causal_mask(int row_offset, int col_offset) {
+        const int warp_idx = threadIdx.x / 32;
+        const int lane = threadIdx.x % 32;
+        
+        // Each thread handles 2 rows (row and row+8) in a 16x8 tile
+        const int m_base = row_offset + warp_idx * MMA_m;
+        
+        #pragma unroll
+        for (int n = 0; n < n_tiles; n++) {
+            const int n_base = col_offset + n * MMA_n;
+            
+            // For each of the 4 elements this thread owns in the tile
+            // Elements (0,1) are for row m_base + (lane/4)
+            // Elements (2,3) are for row m_base + (lane/4) + 8
+            
+            int row_0 = m_base + (lane / 4);
+            int row_1 = m_base + (lane / 4) + 8;
+            
+            // Each element covers 2 columns
+            int col_0 = n_base + (lane % 4) * 2;
+            int col_1 = col_0 + 1;
+            
+            // Apply mask: if col > row, set to -inf
+            if (col_0 > row_0) score_(n, 0) = -cuda::std::numeric_limits<ElementAccum>::infinity();
+            if (col_1 > row_0) score_(n, 1) = -cuda::std::numeric_limits<ElementAccum>::infinity();
+            if (col_0 > row_1) score_(n, 2) = -cuda::std::numeric_limits<ElementAccum>::infinity();
+            if (col_1 > row_1) score_(n, 3) = -cuda::std::numeric_limits<ElementAccum>::infinity();
+        }
     }
 
  private:
@@ -527,6 +558,8 @@ template<typename KernelTraits>
 __global__ void flash_attention_fwd_kernel(__grid_constant__ const ForwardParams params) {
     using Element = KernelTraits::Element;
 
+    auto mbidx = blockIdx.x;
+
     // init shared memory block tensors
     extern __shared__ char smem_data[];
     Query<KernelTraits> Q(params, reinterpret_cast<Element*>(smem_data));
@@ -538,40 +571,70 @@ __global__ void flash_attention_fwd_kernel(__grid_constant__ const ForwardParams
 
     Softmax<KernelTraits> softmax{};
 
-    Q.copy_gmem_to_smem();
-    cute::cp_async_fence();
+    
 
     constexpr int kBlockN = KernelTraits::kBlockN;
-    const int n_blocks = params.seqlen_k / kBlockN;
-    for (int nbi = 0; nbi < n_blocks; nbi++) {
-        K.copy_gmem_to_smem();
-        cute::cp_async_fence();
+    constexpr int kBlockM = KernelTraits::kBlockM;
+    // blocks in N dimension
+    const int n_blocks = cute::ceil_div(params.seqlen_k, kBlockN);
+    const int row_offset_base = mbidx * kBlockM;
+    
+    // Determine which K/V blocks to process
+    // For causal: only process blocks where some elements are not masked
+    // Skip block if: row_offset_base > col_offset_end
+    // In other words: skip if the first row of Q is after the last column of K
+    const int n_block_min = 0;
+    const int n_block_max = params.is_causal 
+        ? cute::ceil_div(row_offset_base + kBlockM, kBlockN)  // Only process up to diagonal
+        : n_blocks;
+    
+    Q.copy_gmem_to_smem();
+    K.copy_gmem_to_smem();
+    cute::cp_async_fence();
 
+
+    for (int nbidx = n_block_min; nbidx < n_block_max; nbidx++) {
         cute::cp_async_wait<0>();
+        __syncthreads();  // Ensure K is fully loaded before computing scores
 
+        // Load next V block into shared memory
         V.copy_gmem_to_smem();
+        V.advance(params);
         cute::cp_async_fence();
 
         Score<KernelTraits> score(Q, K);
-        softmax.update(score, params.softmax_scale_log2, nbi == 0);
+
+        // Apply causal mask if requested
+        if (params.is_causal) {
+            const int row_offset = row_offset_base;
+            const int col_offset = nbidx * kBlockN;
+            score.set_causal_mask(row_offset, col_offset);
+        }
+        
+        softmax.update(score, params.softmax_scale_log2, nbidx == n_block_min);
 
         cute::cp_async_wait<0>();
-        O.accum(softmax.rescale(), score.score(), V, nbi == 0);
+        __syncthreads();  // Ensure V is fully loaded before accumulation
 
-        K.advance(params);
-        V.advance(params);
+        if (nbidx + 1 < n_block_max) {
+            K.advance(params);
+            K.copy_gmem_to_smem();
+            cute::cp_async_fence();
+        }
+
+        O.accum(softmax.rescale(), score.score(), V, nbidx == n_block_min);
     }
 
     softmax.reduce_sum_expsum();
 
     O.normalize(softmax.expsum());
-
+    
     O.copy_rmem_to_smem();
 
+    // Ensure all threads have written to shared memory before reading
     __syncthreads();
         
     O.copy_smem_to_gmem();
-
 }
 
 template<typename KernelTraits>
@@ -581,7 +644,19 @@ void compute_attn(const ForwardParams& params, cudaStream_t stream) {
     dim3 grid(m_blocks, params.heads, params.batch);
     dim3 block(KernelTraits::kNThreads);
 
-    flash_attention_fwd_kernel<KernelTraits><<<grid, block, KernelTraits::smem_size, stream>>>(params);
+    // Set shared memory limit for large head dimensions
+    // SM80 (Ampere) supports up to 164KB per SM, but 48KB per block by default
+    // For head_dim >= 128, we need more than 48KB
+    constexpr int smem_size = KernelTraits::smem_size;
+    if constexpr (smem_size > 48 * 1024) {
+        cudaFuncSetAttribute(
+            flash_attention_fwd_kernel<KernelTraits>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            smem_size
+        );
+    }
+
+    flash_attention_fwd_kernel<KernelTraits><<<grid, block, smem_size, stream>>>(params);
 }
 
 } // namespace mfa

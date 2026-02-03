@@ -68,9 +68,10 @@ void forward_params_init(ForwardParams& params, torch::Tensor q, torch::Tensor k
  * @param q  total_q x num_heads x head_size
  * @param k  total_k x num_heads_k x head_size
  * @param v  total_k x num_heads_k x head_size
+ * @param causal  whether to apply causal mask
  * @return 
  */
-std::vector<at::Tensor> flash_attention_forward(const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v) {
+std::vector<at::Tensor> flash_attention_forward(const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v, bool causal) {
     torch::cuda::CUDAGuard guard(q.device());
 
     auto dtype = q.dtype();
@@ -92,6 +93,7 @@ std::vector<at::Tensor> flash_attention_forward(const torch::Tensor& q, const to
 
     ForwardParams params{};
     forward_params_init(params, q, k, v, out);
+    params.is_causal = causal;
 
     auto stream = torch::cuda::getCurrentCUDAStream();
     run_flash_attention_forward(params, stream);

@@ -33,7 +33,17 @@ struct ForwardKernelTraits {
 
 
     // Swizzle<BBits, MBase, SShift>
-    using SmemSwizzle = cute::Swizzle<3, 3, 4>;
+    // Choose swizzle pattern based on head dimension to optimize shared memory access
+    // and avoid bank conflicts. The swizzle should match the row size in bytes.
+    using SmemSwizzle = std::conditional_t<
+        kHeadDim <= 64,
+        cute::Swizzle<3, 3, 3>,    // For head_dim=32,64: row size = 64-128 bytes
+        std::conditional_t<
+            kHeadDim == 128,
+            cute::Swizzle<3, 3, 4>,  // For head_dim=128: row size = 256 bytes
+            cute::Swizzle<3, 3, 5>   // For head_dim>=256: row size >= 512 bytes
+        >
+    >;
 
     static constexpr int smem_size = (kBlockM + 2 * kBlockN) * kHeadDim * sizeof(Element);
 };

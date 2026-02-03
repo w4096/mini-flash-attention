@@ -4,29 +4,31 @@ import torch
 from mini_flash_attention import flash_attn_func as mini_flash_attn_func
 from flash_attn import flash_attn_func
 
-def flash_attention(q, k, v):
-    return flash_attn_func(q, k, v)
+def flash_attention(q, k, v, causal=False):
+    return flash_attn_func(q, k, v, causal=causal)
 
 
-def torch_attention(q, k, v):
+def torch_attention(q, k, v, causal=False):
     q = q.transpose(1, 2)
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)
     
-    o = torch.nn.functional.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+    o = torch.nn.functional.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=causal)
     return o.transpose(1, 2)
 
-def mini_flash_attention(q, k, v):
+def mini_flash_attention(q, k, v, causal=False):
     # 新的接口直接返回 Tensor，不再返回 tuple
-    return mini_flash_attn_func(q, k, v)
+    return mini_flash_attn_func(q, k, v, causal=causal)
     
 def test_flash_attn_forward():
 
     # Define input parameters
-    batch_size = 1
-    seqlen = 4096 * 2
+    batch_size = 10
+    seqlen = 4096
     dim = 128
-    heads = 1
+    heads = 28
+    is_causal = False
+    
 
     # Create random tensors for q, k, v
     q = torch.randn((batch_size, seqlen, heads, dim), device='cuda', dtype=torch.half)
@@ -40,21 +42,27 @@ def test_flash_attn_forward():
     v = torch.nn.functional.normalize(v, dim=-1)
 
 
+    for _ in range(3):
+        mini_flash_attention(q, k, v, causal=is_causal)
+        torch_attention(q, k, v, causal=is_causal)
+        flash_attention(q, k, v, causal=is_causal)
+
+
     with torch.profiler.profile() as prof:
-        mini_flash_attn_out = mini_flash_attention(q, k, v)
+        mini_flash_attn_out = mini_flash_attention(q, k, v, causal=is_causal)
     key_averages = prof.key_averages()
     print("Mini Flash Attention Profiling Results:")
     print(key_averages.table(sort_by="cuda_time_total", row_limit=10))
     
 
     with torch.profiler.profile() as prof:
-        torch_out = torch_attention(q, k, v)
+        torch_out = torch_attention(q, k, v, causal=is_causal)
     key_averages = prof.key_averages()
     print("Torch Attention Profiling Results:")
     print(key_averages.table(sort_by="cuda_time_total", row_limit=10))
 
     with torch.profiler.profile() as prof:
-        flash_attn_out = flash_attention(q, k, v)
+        flash_attn_out = flash_attention(q, k, v, causal=is_causal)
     key_averages = prof.key_averages()
     print("Flash Attention Profiling Results:")
     print(key_averages.table(sort_by="cuda_time_total", row_limit=10))
