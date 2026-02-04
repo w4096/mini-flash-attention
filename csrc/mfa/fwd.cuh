@@ -32,15 +32,22 @@ class Query {
         smem_ = make_tensor(make_smem_ptr(smem), SmemLayout{});
     }
 
-    __device__ void copy_gmem_to_smem() {
+    __device__ void copy_gmem_to_smem(const ForwardParams& params) {
         // every thread cp 8 elements per iteration (16 bytes)
+        const int row_offset = blockIdx.x * KernelTraits::kBlockM;
+        const int max_row = params.seqlen_q;
+        
         for (unsigned int i = 0; i < size(smem_); i += KernelTraits::kBlockSize * 8) {
             auto idx = i + threadIdx.x * 8;
             auto row = idx / size<1>(smem_);
             auto col = idx % size<1>(smem_);
+            
+            // Check boundary: only copy if within valid range
+            bool valid = (row_offset + row) < max_row;
+            
             auto dst_ptr = reinterpret_cast<int4*>(&smem(row, col));
             auto src_ptr = reinterpret_cast<int4*>(&gmem_(row, col));
-            SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<int4>::copy(*src_ptr, *dst_ptr, true);
+            SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<int4>::copy(*src_ptr, *dst_ptr, valid);
         }
     }
 
@@ -90,14 +97,21 @@ class Key {
 
     __device__ void copy_gmem_to_smem(const ForwardParams& params, int nbidx) {
         set_gmem_address(params, nbidx);
+        
+        const int row_offset = nbidx * KernelTraits::kBlockN;
+        const int max_row = params.seqlen_k;
 
         for (unsigned int i = 0; i < size(smem_); i += KernelTraits::kBlockSize * 8) {
             auto idx = i + threadIdx.x * 8;
             auto row = idx / size<1>(smem_);
             auto col = idx % size<1>(smem_);
+            
+            // Check boundary: only copy if within valid range
+            bool valid = (row_offset + row) < max_row;
+            
             auto dst_ptr = reinterpret_cast<int4*>(&smem(row, col));
             auto src_ptr = reinterpret_cast<int4*>(&gmem_(row, col));
-            SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<int4>::copy(*src_ptr, *dst_ptr, true);
+            SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<int4>::copy(*src_ptr, *dst_ptr, valid);
         }
     }
 
@@ -151,13 +165,21 @@ struct Value {
 
     __device__ void copy_gmem_to_smem(const ForwardParams& params, int nbidx) {
         set_gmem_address(params, nbidx);
+        
+        const int row_offset = nbidx * KernelTraits::kBlockN;
+        const int max_row = params.seqlen_k;
+        
         for (unsigned int i = 0; i < size(smem_); i += KernelTraits::kBlockSize * 8) {
             auto idx = i + threadIdx.x * 8;
             auto row = idx / size<1>(smem_);
             auto col = idx % size<1>(smem_);
+            
+            // Check boundary: only copy if within valid range
+            bool valid = (row_offset + row) < max_row;
+            
             auto dst_ptr = reinterpret_cast<int4*>(&smem(row, col));
             auto src_ptr = reinterpret_cast<int4*>(&gmem_(row, col));
-            SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<int4>::copy(*src_ptr, *dst_ptr, true);
+            SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<int4>::copy(*src_ptr, *dst_ptr, valid);
         }
     }
 
@@ -286,7 +308,10 @@ class Score {
     }
 
     // Set causal mask: set scores to -inf where col_idx > row_idx
-    __device__ void set_causal_mask(int row_offset, int col_offset) {
+    // Unified mask: handles both sequence length mask and causal mask
+    // If is_causal=true: masks where col > row OR col >= seqlen_k
+    // If is_causal=false: masks only where col >= seqlen_k
+    __device__ void set_mask(int row_offset, int col_offset, int seqlen_k, bool is_causal) {
         const int warp_idx = threadIdx.x / 32;
         const int lane = threadIdx.x % 32;
         
@@ -307,11 +332,22 @@ class Score {
             int col_0 = n_base + (lane % 4) * 2;
             int col_1 = col_0 + 1;
             
-            // Apply mask: if col > row, set to -inf
-            if (col_0 > row_0) score_(n, 0) = -cuda::std::numeric_limits<ElementAccum>::infinity();
-            if (col_1 > row_0) score_(n, 1) = -cuda::std::numeric_limits<ElementAccum>::infinity();
-            if (col_0 > row_1) score_(n, 2) = -cuda::std::numeric_limits<ElementAccum>::infinity();
-            if (col_1 > row_1) score_(n, 3) = -cuda::std::numeric_limits<ElementAccum>::infinity();
+            static constexpr auto _inf = -cuda::std::numeric_limits<ElementAccum>::infinity();
+
+            // Apply unified mask
+            if (is_causal) {
+                // Causal mode: mask if col > row OR col >= seqlen_k
+                if (col_0 > row_0 || col_0 >= seqlen_k) score_(n, 0) = _inf;
+                if (col_1 > row_0 || col_1 >= seqlen_k) score_(n, 1) = _inf;
+                if (col_0 > row_1 || col_0 >= seqlen_k) score_(n, 2) = _inf;
+                if (col_1 > row_1 || col_1 >= seqlen_k) score_(n, 3) = _inf;
+            } else {
+                // Non-causal mode: mask only if col >= seqlen_k
+                if (col_0 >= seqlen_k) score_(n, 0) = _inf;
+                if (col_1 >= seqlen_k) score_(n, 1) = _inf;
+                if (col_0 >= seqlen_k) score_(n, 2) = _inf;
+                if (col_1 >= seqlen_k) score_(n, 3) = _inf;
+            }
         }
     }
 
@@ -344,7 +380,7 @@ class Softmax {
         cute::fill(row_max_, -cuda::std::numeric_limits<ElementAccum>::infinity());
     }
 
-    __device__ void update(Score<KernelTraits>& score, float softmax_scale_log2, bool first) {
+    __device__ void update(Score<KernelTraits>& score, float softmax_scale_log2) {
         // compute max per row
         auto new_row_max = cute::make_tensor<ElementAccum>(RowMaxTensorLayout{});
         score.compute_row_max(new_row_max);
@@ -372,13 +408,8 @@ class Softmax {
         }
 
         // update exp sum with rescaling
-        if (first) {
-            expsum_(0) = sum_0;
-            expsum_(1) = sum_1;
-        } else {
-            expsum_(0) = __fmaf_rn(expsum_(0), rescale_(0), sum_0);
-            expsum_(1) = __fmaf_rn(expsum_(1), rescale_(1), sum_1);
-        }
+        expsum_(0) = __fmaf_rn(expsum_(0), rescale_(0), sum_0);
+        expsum_(1) = __fmaf_rn(expsum_(1), rescale_(1), sum_1);
     }
 
     __device__ void reduce_sum_expsum() {
@@ -444,7 +475,7 @@ struct Output {
 
     template<typename Tensor0>
     __device__ void accum(const Softmax<KernelTraits>::RescaleTensor& rescale, Tensor0 const& score,
-                          const Value<KernelTraits>& value, bool first) {
+                          const Value<KernelTraits>& value) {
         
         for (int n = 0; n < n_tiles; n++) {
             float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
@@ -488,17 +519,10 @@ struct Output {
                 // clang-format on
             }
 
-            if (first) {
-                rmem_(n, 0) = c0;
-                rmem_(n, 1) = c1;
-                rmem_(n, 2) = c2;
-                rmem_(n, 3) = c3;
-            } else {
-                rmem_(n, 0) = __fmaf_rn(rmem_(n, 0), rescale(0), c0);
-                rmem_(n, 1) = __fmaf_rn(rmem_(n, 1), rescale(0), c1);
-                rmem_(n, 2) = __fmaf_rn(rmem_(n, 2), rescale(1), c2);
-                rmem_(n, 3) = __fmaf_rn(rmem_(n, 3), rescale(1), c3);
-            }
+            rmem_(n, 0) = __fmaf_rn(rmem_(n, 0), rescale(0), c0);
+            rmem_(n, 1) = __fmaf_rn(rmem_(n, 1), rescale(0), c1);
+            rmem_(n, 2) = __fmaf_rn(rmem_(n, 2), rescale(1), c2);
+            rmem_(n, 3) = __fmaf_rn(rmem_(n, 3), rescale(1), c3);
         }
     }
 
@@ -517,13 +541,20 @@ struct Output {
         }
     }
 
-    __device__ void copy_smem_to_gmem() {
+    __device__ void copy_smem_to_gmem(const ForwardParams& params) {
+        const int row_offset = blockIdx.x * KernelTraits::kBlockM;
+        const int max_row = params.seqlen_q;
+        
         for (unsigned int i = 0; i < size(smem_); i += KernelTraits::kBlockSize * 8) {
             auto idx = i + threadIdx.x * 8;
             auto row = idx / size<1>(smem_);
             auto col = idx % size<1>(smem_);
-            // vectorize
-            *reinterpret_cast<uint4*>(&gmem_(row, col)) = *reinterpret_cast<uint4*>(&smem(row, col));
+            
+            // Check boundary: only write if within valid range
+            if ((row_offset + row) < max_row) {
+                // vectorize
+                *reinterpret_cast<uint4*>(&gmem_(row, col)) = *reinterpret_cast<uint4*>(&smem(row, col));
+            }
         }
     }
 
@@ -595,7 +626,8 @@ __global__ void flash_attention_fwd_kernel(__grid_constant__ const ForwardParams
 
     Softmax<KernelTraits> softmax{};
 
-    
+    Q.copy_gmem_to_smem(params);
+    cute::cp_async_fence();
 
     constexpr int kBlockN = KernelTraits::kBlockN;
     constexpr int kBlockM = KernelTraits::kBlockM;
@@ -612,39 +644,36 @@ __global__ void flash_attention_fwd_kernel(__grid_constant__ const ForwardParams
         ? cute::ceil_div(row_offset_base + kBlockM, kBlockN)  // Only process up to diagonal
         : n_blocks;
     
-    Q.copy_gmem_to_smem();
-    K.copy_gmem_to_smem(params, n_block_min);
-    cute::cp_async_fence();
 
 
     for (int nbidx = n_block_min; nbidx < n_block_max; nbidx++) {
+        K.copy_gmem_to_smem(params, nbidx);
+        cute::cp_async_fence();
+
         cute::cp_async_wait<0>();
         __syncthreads();  // Ensure K is fully loaded before computing scores
 
-        // Load next V block into shared memory
         V.copy_gmem_to_smem(params, nbidx);
         cute::cp_async_fence();
 
         Score<KernelTraits> score(Q, K);
 
-        // Apply causal mask if requested
-        if (params.is_causal) {
-            const int row_offset = row_offset_base;
-            const int col_offset = nbidx * kBlockN;
-            score.set_causal_mask(row_offset, col_offset);
+        // Apply unified mask (handles both seqlen and causal masks)
+        const int col_offset = nbidx * kBlockN;
+        
+        // Skip masking if entire block is within valid range
+        // This is common when seqlen_k is a multiple of kBlockN
+        const bool need_mask = params.is_causal || (col_offset + kBlockN > params.seqlen_k);
+        
+        if (need_mask) {
+            score.set_mask(row_offset_base, col_offset, params.seqlen_k, params.is_causal);
         }
         
-        softmax.update(score, params.softmax_scale_log2, nbidx == n_block_min);
+        softmax.update(score, params.softmax_scale_log2);
 
         cute::cp_async_wait<0>();
         __syncthreads();  // Ensure V is fully loaded before accumulation
-
-        if (nbidx + 1 < n_block_max) {
-            K.copy_gmem_to_smem(params, nbidx + 1);
-            cute::cp_async_fence();
-        }
-
-        O.accum(softmax.rescale(), score.score(), V, nbidx == n_block_min);
+        O.accum(softmax.rescale(), score.score(), V);
     }
 
     softmax.reduce_sum_expsum();
@@ -656,7 +685,7 @@ __global__ void flash_attention_fwd_kernel(__grid_constant__ const ForwardParams
     // Ensure all threads have written to shared memory before reading
     __syncthreads();
         
-    O.copy_smem_to_gmem();
+    O.copy_smem_to_gmem(params);
 }
 
 template<typename KernelTraits>
