@@ -2,70 +2,63 @@
 
 A minimal, educational implementation of Flash Attention v2 in CUDA. This project demonstrates the core concepts of Flash Attention with a focus on code clarity and understanding.
 
-## Features
+## What's This?
 
-- ✅ **Flash Attention v2 Algorithm**: Implements the tiling and online softmax algorithm
-- ✅ **Tensor Core Acceleration**: Utilizes CUDA Tensor Cores for fast matrix multiplications
-- ✅ **FP16/BF16 Support**: Supports both half precision data types
-- ✅ **Memory Efficient**: Uses shared memory tiling to reduce HBM bandwidth
-- ✅ **PyTorch Integration**: Seamless integration with PyTorch tensors
+Flash Attention is a fast and memory-efficient attention algorithm that makes training large models more practical. This is a simplified version that keeps the core ideas while being easier to understand and modify.
 
-## Architecture
+**Key features:**
+- Flash Attention v2 algorithm with tiling
+- CUDA Tensor Cores for matrix operations
+- FP16 and BF16 support
+- Variable-length sequences (continuous batching)
+- Works seamlessly with PyTorch
 
-The implementation follows the Flash Attention v2 algorithm with these key components:
+## Getting Started
 
-### Core Components
-
-- **Query/Key/Value Tiles**: Efficient global memory to shared memory copying with `cp.async`
-- **Score Computation**: Q@K^T matrix multiplication using Tensor Core MMA instructions
-- **Online Softmax**: Numerically stable softmax with rescaling for incremental computation
-- **Output Accumulation**: P@V computation with FMA instructions for precision
-
-## Installation
-
-### Prerequisites
-
-- CUDA Toolkit 11.8+ (tested with CUDA 12.8)
+**Requirements:**
+- CUDA 11.8+ (tested on CUDA 12.8)
 - Python 3.8+
 - PyTorch 2.0+
-- GCC/G++ with C++20 support
-- NVIDIA GPU with Compute Capability 8.0+ (Ampere or newer)
+- NVIDIA Ampere GPU or newer (SM 80+)
 
-### Recommended Setup
-
+**Build:**
 ```bash
 git clone https://github.com/w4096/mini-flash-attention.git
 cd mini-flash-attention
 git submodule update --init --recursive
 
-# Build the extension
 python setup.py build
-
-# set path to the built extension (replace XXX with the real path)
-export PYTHONPATH=$(pwd)/build/lib.XXX
-
-# run benchmarks
-python ./benchmark/run.py
+export PYTHONPATH=$(pwd)/build/lib.linux-x86_64-cpython-312
 ```
 
-## Usage
+## Quick Example
 
 ```python
 import torch
-from mini_flash_attention import mini_flash_attn_func
+from mini_flash_attention import flash_attn_func
 
-# Create random input tensors
-batch_size = 1
-seqlen = 4096
-heads = 8
-head_dim = 128
+# Standard batched attention
+q = torch.randn(2, 1024, 8, 128, device='cuda', dtype=torch.float16)
+k = torch.randn(2, 1024, 8, 128, device='cuda', dtype=torch.float16)
+v = torch.randn(2, 1024, 8, 128, device='cuda', dtype=torch.float16)
 
-q = torch.randn(batch_size, seqlen, heads, head_dim, device='cuda', dtype=torch.float16)
-k = torch.randn(batch_size, seqlen, heads, head_dim, device='cuda', dtype=torch.float16)
-v = torch.randn(batch_size, seqlen, heads, head_dim, device='cuda', dtype=torch.float16)
+output = flash_attn_func(q, k, v, causal=True)
+```
 
-# Compute attention
-output = mini_flash_attn_func(q, k, v)[0]
+For continuous batching (variable-length sequences):
+```python
+from mini_flash_attention import flash_attn_varlen_func
+
+# Different sequence lengths in one batch
+seqlens = [128, 256, 512]
+total = sum(seqlens)
+
+q = torch.randn(total, 8, 64, device='cuda', dtype=torch.float16)
+k = torch.randn(total, 8, 64, device='cuda', dtype=torch.float16) 
+v = torch.randn(total, 8, 64, device='cuda', dtype=torch.float16)
+
+cu_seqlens = torch.tensor([0] + seqlens, dtype=torch.int32, device='cuda').cumsum(0)
+output = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max(seqlens), max(seqlens))
 ```
 
 ## Performance
@@ -88,31 +81,26 @@ Max difference between torch and flash-attn: 3.814697265625e-06
 Max difference between torch and mini-flash-attn: 3.814697265625e-06
 ```
 
-## Technical Details
+Run `python benchmark/run.py` to test on your hardware.
 
-### Algorithm Overview
+## How It Works
 
-1. **Tiling**: Split Q into blocks of size `(BlockM, HeadDim)` and K,V into blocks of size `(BlockN, HeadDim)`
-2. **Score Computation**: For each Q tile, compute attention scores with all K tiles
-3. **Online Softmax**: Update running maximum and exponential sum incrementally
-4. **Output Accumulation**: Accumulate P@V products with proper rescaling
+The implementation splits Q, K, V into tiles and processes them in chunks:
 
-### Key Optimizations
+1. Load a tile of Q into shared memory
+2. Loop through K/V tiles, computing attention scores incrementally  
+3. Use online softmax to maintain numerical stability
+4. Accumulate the output on-the-fly
 
-- **Swizzled Shared Memory**: Bank conflict reduction using XOR-based swizzling
-- **Async Copy**: Non-blocking global-to-shared memory transfers with `cp.async`
-- **Fused Operations**: FMA instructions (`__fmaf_rn`) for reduced rounding errors
-- **Vectorized Loads/Stores**: 128-bit memory transactions
+This approach keeps memory usage low while being fast thanks to:
+- CUDA Tensor Cores for matrix multiplications
+- Shared memory tiling to reduce bandwidth
+- Async memory copies to overlap computation
+- Swizzled memory layouts to avoid bank conflicts
 
-### CUDA Kernel Configuration
+The code uses NVIDIA CuTe library for clean tensor operations.
 
-- **Block Size**: 128 threads (4 warps)
-- **Tile Dimensions**: BlockM=64, BlockN=64 (configurable)
-- **Shared Memory**: ~24KB per block
-- **MMA Shape**: 16x8x16 (M x N x K)
-
-
-## TODO
+## What's Next
 
 - [x] Implement causal masking
 - [x] Support variable sequence lengths
@@ -121,11 +109,7 @@ Max difference between torch and mini-flash-attn: 3.814697265625e-06
 
 ## References
 
-- [Flash Attention v2 Paper](https://arxiv.org/abs/2307.08691) (Dao, 2023)
-- [Official Flash Attention Implementation](https://github.com/Dao-AILab/flash-attention)
+Based on the Flash Attention v2 paper by Tri Dao (2023). Uses NVIDIA Cutlass/CuTe libraries.
 
-
-## Acknowledgments
-
-- Built with [NVIDIA Cutlass](https://github.com/NVIDIA/cutlass) and CuTe
-- Inspired by the original [Flash Attention](https://github.com/Dao-AILab/flash-attention) implementation
+- [Flash Attention v2 Paper](https://arxiv.org/abs/2307.08691)
+- [Official Implementation](https://github.com/Dao-AILab/flash-attention)
