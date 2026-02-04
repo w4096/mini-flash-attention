@@ -307,8 +307,6 @@ class Score {
         return score_(n, idx);
     }
 
-    // Set causal mask: set scores to -inf where col_idx > row_idx
-    // Unified mask: handles both sequence length mask and causal mask
     // If is_causal=true: masks where col > row OR col >= seqlen_k
     // If is_causal=false: masks only where col >= seqlen_k
     __device__ void set_mask(int row_offset, int col_offset, int seqlen_k, bool is_causal) {
@@ -332,22 +330,12 @@ class Score {
             int col_0 = n_base + (lane % 4) * 2;
             int col_1 = col_0 + 1;
             
-            static constexpr auto _inf = -cuda::std::numeric_limits<ElementAccum>::infinity();
-
             // Apply unified mask
-            if (is_causal) {
-                // Causal mode: mask if col > row OR col >= seqlen_k
-                if (col_0 > row_0 || col_0 >= seqlen_k) score_(n, 0) = _inf;
-                if (col_1 > row_0 || col_1 >= seqlen_k) score_(n, 1) = _inf;
-                if (col_0 > row_1 || col_0 >= seqlen_k) score_(n, 2) = _inf;
-                if (col_1 > row_1 || col_1 >= seqlen_k) score_(n, 3) = _inf;
-            } else {
-                // Non-causal mode: mask only if col >= seqlen_k
-                if (col_0 >= seqlen_k) score_(n, 0) = _inf;
-                if (col_1 >= seqlen_k) score_(n, 1) = _inf;
-                if (col_0 >= seqlen_k) score_(n, 2) = _inf;
-                if (col_1 >= seqlen_k) score_(n, 3) = _inf;
-            }
+            // Unified mask: check causal condition OR seqlen condition
+            if ((is_causal && col_0 > row_0) || col_0 >= seqlen_k) score_(n, 0) = -INFINITY;
+            if ((is_causal && col_1 > row_0) || col_1 >= seqlen_k) score_(n, 1) = -INFINITY;
+            if ((is_causal && col_0 > row_1) || col_0 >= seqlen_k) score_(n, 2) = -INFINITY;
+            if ((is_causal && col_1 > row_1) || col_1 >= seqlen_k) score_(n, 3) = -INFINITY;
         }
     }
 
@@ -385,6 +373,7 @@ class Softmax {
         auto new_row_max = cute::make_tensor<ElementAccum>(RowMaxTensorLayout{});
         score.compute_row_max(new_row_max);
 
+        // for subsequent blocks, compute rescale factors
         #pragma unroll
         for (int i = 0; i < size<0>(row_max_); i++) {
             ElementAccum new_max = max(new_row_max(i), row_max_(i));
@@ -519,6 +508,7 @@ struct Output {
                 // clang-format on
             }
 
+            
             rmem_(n, 0) = __fmaf_rn(rmem_(n, 0), rescale(0), c0);
             rmem_(n, 1) = __fmaf_rn(rmem_(n, 1), rescale(0), c1);
             rmem_(n, 2) = __fmaf_rn(rmem_(n, 2), rescale(1), c2);
@@ -626,8 +616,6 @@ __global__ void flash_attention_fwd_kernel(__grid_constant__ const ForwardParams
 
     Softmax<KernelTraits> softmax{};
 
-    Q.copy_gmem_to_smem(params);
-    cute::cp_async_fence();
 
     constexpr int kBlockN = KernelTraits::kBlockN;
     constexpr int kBlockM = KernelTraits::kBlockM;
@@ -644,12 +632,12 @@ __global__ void flash_attention_fwd_kernel(__grid_constant__ const ForwardParams
         ? cute::ceil_div(row_offset_base + kBlockM, kBlockN)  // Only process up to diagonal
         : n_blocks;
     
+    Q.copy_gmem_to_smem(params);
+    K.copy_gmem_to_smem(params, n_block_min);
+    cute::cp_async_fence();
 
 
     for (int nbidx = n_block_min; nbidx < n_block_max; nbidx++) {
-        K.copy_gmem_to_smem(params, nbidx);
-        cute::cp_async_fence();
-
         cute::cp_async_wait<0>();
         __syncthreads();  // Ensure K is fully loaded before computing scores
 
@@ -673,6 +661,12 @@ __global__ void flash_attention_fwd_kernel(__grid_constant__ const ForwardParams
 
         cute::cp_async_wait<0>();
         __syncthreads();  // Ensure V is fully loaded before accumulation
+
+        if (nbidx + 1 < n_block_max) {
+            K.copy_gmem_to_smem(params, nbidx + 1);
+            cute::cp_async_fence();
+        }
+
         O.accum(softmax.rescale(), score.score(), V);
     }
 
