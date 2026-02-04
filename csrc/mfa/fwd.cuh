@@ -8,6 +8,79 @@ using namespace cute;
 
 namespace mfa {
 
+
+template<typename KernelTraits>
+class Context {
+ public:
+    __device__ Context(const ForwardParams& params, const int batch_idx, const int head_idx, const int block_m_idx) {
+        if (params.cu_seqlens_q) {
+            // Variable-length mode
+            q_row_offset = params.cu_seqlens_q[batch_idx];
+            k_row_offset = params.cu_seqlens_k[batch_idx];
+            actual_seqlen_q = params.cu_seqlens_q[batch_idx + 1] - q_row_offset;
+            actual_seqlen_k = params.cu_seqlens_k[batch_idx + 1] - k_row_offset;
+        } else {
+            // Fixed-length mode
+            q_row_offset = 0;
+            k_row_offset = 0;
+            actual_seqlen_q = params.seqlen_q;
+            actual_seqlen_k = params.seqlen_k;
+        }
+    }
+
+    __device__ size_t get_q_gmem_offset(const ForwardParams& params, int batch_idx, int head_idx, int block_m_idx) const {
+        if (params.cu_seqlens_q) {
+            // In varlen mode, data is [total_tokens, heads, dim]
+            return (q_row_offset + block_m_idx * KernelTraits::kBlockM) * params.q_row_stride
+                   + head_idx * params.q_head_stride;
+        } else {
+            return batch_idx * params.q_batch_stride + head_idx * params.q_head_stride
+                   + block_m_idx * KernelTraits::kBlockM * params.q_row_stride;
+        }
+    }
+
+    __device__ size_t get_k_gmem_offset(const ForwardParams& params, int batch_idx, int head_idx, int block_n_idx) const {
+        head_idx = head_idx / params.kv_group_size;
+        if (params.cu_seqlens_k) {
+            return (k_row_offset + block_n_idx * KernelTraits::kBlockN) * params.k_row_stride
+                   + head_idx * params.k_head_stride;
+        } else {
+            return batch_idx * params.k_batch_stride + head_idx * params.k_head_stride
+                   + block_n_idx * KernelTraits::kBlockN * params.k_row_stride;
+        }
+    }
+
+    __device__ size_t get_v_gmem_offset(const ForwardParams& params, int batch_idx, int head_idx, int block_n_idx) const {
+        head_idx = head_idx / params.kv_group_size;
+        if (params.cu_seqlens_k) {
+            return (k_row_offset + block_n_idx * KernelTraits::kBlockN) * params.v_row_stride
+                   + head_idx * params.v_head_stride;
+        } else {
+            return batch_idx * params.v_batch_stride + head_idx * params.v_head_stride
+                   + block_n_idx * KernelTraits::kBlockN * params.v_row_stride;
+        }
+    }
+
+    __device__ size_t get_o_gmem_offset(const ForwardParams& params, int batch_idx, int head_idx, int block_m_idx) const {
+        if (params.cu_seqlens_q) {
+            return (q_row_offset + block_m_idx * KernelTraits::kBlockM) * params.o_row_stride
+                   + head_idx * params.o_head_stride;
+        } else {
+            return batch_idx * params.o_batch_stride + head_idx * params.o_head_stride
+                   + block_m_idx * KernelTraits::kBlockM * params.o_row_stride;
+        }
+    }
+
+    int actual_seqlen_q;
+    int actual_seqlen_k;
+
+private:
+
+    int q_row_offset;
+    int k_row_offset;
+};
+
+
 template<typename KernelTraits>
 class Query {
  public:
@@ -23,8 +96,8 @@ class Query {
     using GmemLayout = Layout<GmemShape, GmemStride>;
     using GmemTensor = decltype(make_tensor(make_gmem_ptr<Element>(nullptr), GmemLayout{}));
 
-    explicit __device__ Query(const ForwardParams& params, Element* smem) {
-        const size_t offset = get_gmem_offset(params, blockIdx.z, blockIdx.y, blockIdx.x * KernelTraits::kBlockM);
+    explicit __device__ Query(const Context<KernelTraits>& ctx, const ForwardParams& params, Element* smem) {
+        const size_t offset = ctx.get_q_gmem_offset(params, blockIdx.z, blockIdx.y, blockIdx.x);
         auto gmem_ptr = static_cast<Element*>(params.q_ptr) + offset;
         const auto layout = make_layout(GmemShape{}, make_stride(params.q_row_stride, _1{}));
         gmem_ = make_tensor(make_gmem_ptr<Element>(gmem_ptr), layout);
@@ -32,10 +105,9 @@ class Query {
         smem_ = make_tensor(make_smem_ptr(smem), SmemLayout{});
     }
 
-    __device__ void copy_gmem_to_smem(const ForwardParams& params) {
-        // every thread cp 8 elements per iteration (16 bytes)
+    __device__ void copy_gmem_to_smem(const Context<KernelTraits>& ctx, const ForwardParams& params) {
         const int row_offset = blockIdx.x * KernelTraits::kBlockM;
-        const int max_row = params.seqlen_q;
+        const int max_row = ctx.actual_seqlen_q;
         
         for (unsigned int i = 0; i < size(smem_); i += KernelTraits::kBlockSize * 8) {
             auto idx = i + threadIdx.x * 8;
@@ -62,10 +134,6 @@ class Query {
     }
 
  private:
-
-    __device__ index_t get_gmem_offset(const ForwardParams& params, int batch, int head, int row) const {
-        return batch * params.q_batch_stride + head * params.q_head_stride + row * params.q_row_stride;
-    };
 
     SmemTensor smem_;
     GmemTensor gmem_;
@@ -85,8 +153,8 @@ class Key {
     using GmemStride = Stride<index_t, _1>; // the row stride is dynamic
     using GmemTensor = decltype(make_tensor(make_gmem_ptr<Element>(nullptr), make_layout(GmemShape{}, GmemStride{})));
 
-    explicit __device__ Key(const ForwardParams& params, Element* smem) {
-        const size_t offset = get_gmem_offset(params, blockIdx.z, blockIdx.y, 0);
+    explicit __device__ Key(const Context<KernelTraits>& ctx, const ForwardParams& params, Element* smem) {
+        const size_t offset = ctx.get_k_gmem_offset(params, blockIdx.z, blockIdx.y, 0);
 
         auto gmem_ptr = static_cast<Element*>(params.k_ptr) + offset;
         const auto layout = make_layout(GmemShape{}, make_stride(params.k_row_stride, _1{}));
@@ -95,11 +163,11 @@ class Key {
         smem_ = make_tensor(make_smem_ptr(smem), SmemLayout{});
     }
 
-    __device__ void copy_gmem_to_smem(const ForwardParams& params, int nbidx) {
-        set_gmem_address(params, nbidx);
+    __device__ void copy_gmem_to_smem(const Context<KernelTraits>& ctx, const ForwardParams& params, int nbidx) {
+        set_gmem_address(ctx, params, nbidx);
         
         const int row_offset = nbidx * KernelTraits::kBlockN;
-        const int max_row = params.seqlen_k;
+        const int max_row = ctx.actual_seqlen_k;
 
         for (unsigned int i = 0; i < size(smem_); i += KernelTraits::kBlockSize * 8) {
             auto idx = i + threadIdx.x * 8;
@@ -127,17 +195,11 @@ class Key {
 
 
  private:
-    __forceinline__ __device__ void set_gmem_address(const ForwardParams& params, int nbidx) {
-        int row = nbidx * KernelTraits::kBlockN;
-        const size_t offset = get_gmem_offset(params, blockIdx.z, blockIdx.y, row);
+    __forceinline__ __device__ void set_gmem_address(const Context<KernelTraits>& ctx, const ForwardParams& params, int nbidx) {
+        const size_t offset = ctx.get_k_gmem_offset(params, blockIdx.z, blockIdx.y, nbidx);
         auto gmem_ptr = static_cast<Element*>(params.k_ptr) + offset;
         gmem_ = make_tensor(make_gmem_ptr<Element>(gmem_ptr), gmem_.layout());
     }
-
-    __device__ index_t get_gmem_offset(const ForwardParams& params, int batch, int head, int row) const {
-        head = head / params.kv_group_size;
-        return batch * params.k_batch_stride + head * params.k_head_stride + row * params.k_row_stride;
-    };
 
     SmemTensor smem_;
     GmemTensor gmem_;
@@ -154,8 +216,8 @@ struct Value {
     using GmemShape = Key<KernelTraits>::GmemShape;
     using GmemTensor = Key<KernelTraits>::GmemTensor;
 
-    __device__ explicit Value(const ForwardParams& params, Element* smem) {
-        const index_t offset = get_gmem_offset(params, blockIdx.z, blockIdx.y, 0);
+    __device__ explicit Value(const Context<KernelTraits>& ctx, const ForwardParams& params, Element* smem) {
+        const index_t offset = ctx.get_v_gmem_offset(params, blockIdx.z, blockIdx.y, 0);
         auto gmem_ptr = static_cast<Element*>(params.v_ptr) + offset;
         const auto layout = make_layout(GmemShape{}, make_stride(params.v_row_stride, _1{}));
         gmem_ = make_tensor(make_gmem_ptr<Element>(gmem_ptr), layout);
@@ -163,11 +225,11 @@ struct Value {
         smem_ = make_tensor(make_smem_ptr(smem), SmemLayout{});
     }
 
-    __device__ void copy_gmem_to_smem(const ForwardParams& params, int nbidx) {
-        set_gmem_address(params, nbidx);
+    __device__ void copy_gmem_to_smem(const Context<KernelTraits>& ctx, const ForwardParams& params, int nbidx) {
+        set_gmem_address(ctx, params, nbidx);
         
         const int row_offset = nbidx * KernelTraits::kBlockN;
-        const int max_row = params.seqlen_k;
+        const int max_row = ctx.actual_seqlen_k;
         
         for (unsigned int i = 0; i < size(smem_); i += KernelTraits::kBlockSize * 8) {
             auto idx = i + threadIdx.x * 8;
@@ -196,17 +258,11 @@ struct Value {
 
  private:
 
-    __forceinline__ __device__ void set_gmem_address(const ForwardParams& params, int nbidx) {
-        int row = nbidx * KernelTraits::kBlockN;
-        const size_t offset = get_gmem_offset(params, blockIdx.z, blockIdx.y, row);
+    __forceinline__ __device__ void set_gmem_address(const Context<KernelTraits>& ctx, const ForwardParams& params, int nbidx) {
+        const size_t offset = ctx.get_v_gmem_offset(params, blockIdx.z, blockIdx.y, nbidx);
         auto gmem_ptr = static_cast<Element*>(params.v_ptr) + offset;
         gmem_ = make_tensor(make_gmem_ptr<Element>(gmem_ptr), gmem_.layout());
     }
-
-    __device__ index_t get_gmem_offset(const ForwardParams& params, int batch, int head, int row) const {
-        head = head / params.kv_group_size;
-        return batch * params.v_batch_stride + head * params.v_head_stride + row * params.v_row_stride;
-    };
 
     SmemTensor smem_;
     GmemTensor gmem_;
@@ -450,11 +506,11 @@ struct Output {
     using SmemLayout = Query<KernelTraits>::SmemLayout;
     using SmemTensor = Query<KernelTraits>::SmemTensor;
 
-    explicit __device__ Output(const ForwardParams& params, Element* smem) {
+    explicit __device__ Output(const Context<KernelTraits>& ctx, const ForwardParams& params, Element* smem) {
         rmem_ = make_tensor<ElementAccum>(RmemLayout{});
         cute::fill(rmem_, .0f);
 
-        const index_t offset = get_gmem_offset(params, blockIdx.z, blockIdx.y, blockIdx.x * KernelTraits::kBlockM);
+        const index_t offset = ctx.get_o_gmem_offset(params, blockIdx.z, blockIdx.y, blockIdx.x);
         auto gmem_ptr = static_cast<Element*>(params.o_ptr) + offset;
         auto layout = make_layout(GmemShape{}, make_stride(params.o_row_stride, _1{}));
         gmem_ = make_tensor(make_gmem_ptr(gmem_ptr), layout);
@@ -531,17 +587,17 @@ struct Output {
         }
     }
 
-    __device__ void copy_smem_to_gmem(const ForwardParams& params) {
-        const int row_offset = blockIdx.x * KernelTraits::kBlockM;
-        const int max_row = params.seqlen_q;
+    __device__ void copy_smem_to_gmem(const Context<KernelTraits>& ctx, const ForwardParams& params) {
+        const int max_row = ctx.actual_seqlen_q;
+        const int block_row_offset = blockIdx.x * KernelTraits::kBlockM;
         
         for (unsigned int i = 0; i < size(smem_); i += KernelTraits::kBlockSize * 8) {
             auto idx = i + threadIdx.x * 8;
             auto row = idx / size<1>(smem_);
             auto col = idx % size<1>(smem_);
             
-            // Check boundary: only write if within valid range
-            if ((row_offset + row) < max_row) {
+            // Check boundary: only write if within valid sequence length
+            if ((block_row_offset + row) < max_row) {
                 // vectorize
                 *reinterpret_cast<uint4*>(&gmem_(row, col)) = *reinterpret_cast<uint4*>(&smem(row, col));
             }
@@ -590,10 +646,6 @@ struct Output {
 
     
  private:
-    __device__ index_t get_gmem_offset(const ForwardParams& params, int batch, int head, int row) const {
-        return batch * params.o_batch_stride + head * params.o_head_stride + row * params.o_row_stride;
-    };
-
     RmemTensor rmem_;
     GmemTensor gmem_;
     SmemTensor smem_;
@@ -603,37 +655,47 @@ template<typename KernelTraits>
 __global__ void flash_attention_fwd_kernel(__grid_constant__ const ForwardParams params) {
     using Element = KernelTraits::Element;
 
-    auto mbidx = blockIdx.x;
+    constexpr int kBlockN = KernelTraits::kBlockN;
+    constexpr int kBlockM = KernelTraits::kBlockM;
+
+    const int m_block_idx = blockIdx.x;
+    const int head_idx = blockIdx.y;
+    const int batch_idx = blockIdx.z;
+    
+    Context<KernelTraits> ctx(params, batch_idx, head_idx, m_block_idx);
+    if (ctx.actual_seqlen_q <= m_block_idx * kBlockM) {
+        return;
+    }
 
     // init shared memory block tensors
     extern __shared__ char smem_data[];
-    Query<KernelTraits> Q(params, reinterpret_cast<Element*>(smem_data));
-    uint32_t offset = size(typename Query<KernelTraits>::SmemLayout{});
-    Key<KernelTraits> K(params, reinterpret_cast<Element*>(smem_data) + offset);
-    offset += size(typename Key<KernelTraits>::SmemLayout{});
-    Value<KernelTraits> V(params, reinterpret_cast<Element*>(smem_data) + offset);
-    Output<KernelTraits> O(params, reinterpret_cast<Element*>(smem_data + 0)); // reuse Q's smem
+    Element* smem_ptr = reinterpret_cast<Element*>(smem_data);
 
+    Query<KernelTraits> Q(ctx, params, smem_ptr);
+    uint32_t offset = size(typename Query<KernelTraits>::SmemLayout{});
+    Key<KernelTraits> K(ctx, params, smem_ptr + offset);
+    
+    offset += size(typename Key<KernelTraits>::SmemLayout{});
+    Value<KernelTraits> V(ctx, params, smem_ptr + offset);
+    
+    Output<KernelTraits> O(ctx, params, smem_ptr + 0); // reuse Q's smem
+
+    // softmax keep track of row max and exp sum
     Softmax<KernelTraits> softmax{};
 
-
-    constexpr int kBlockN = KernelTraits::kBlockN;
-    constexpr int kBlockM = KernelTraits::kBlockM;
     // blocks in N dimension
-    const int n_blocks = cute::ceil_div(params.seqlen_k, kBlockN);
-    const int row_offset_base = mbidx * kBlockM;
+    const int n_blocks = cute::ceil_div(ctx.actual_seqlen_k, kBlockN);
     
     // Determine which K/V blocks to process
     // For causal: only process blocks where some elements are not masked
-    // Skip block if: row_offset_base > col_offset_end
-    // In other words: skip if the first row of Q is after the last column of K
     const int n_block_min = 0;
     const int n_block_max = params.is_causal 
-        ? cute::ceil_div(row_offset_base + kBlockM, kBlockN)  // Only process up to diagonal
+        ? cute::ceil_div((m_block_idx + 1) * kBlockM, kBlockN)  // Only process up to diagonal
         : n_blocks;
-    
-    Q.copy_gmem_to_smem(params);
-    K.copy_gmem_to_smem(params, n_block_min);
+
+
+    Q.copy_gmem_to_smem(ctx, params);
+    K.copy_gmem_to_smem(ctx, params, n_block_min);
     cute::cp_async_fence();
 
 
@@ -641,7 +703,7 @@ __global__ void flash_attention_fwd_kernel(__grid_constant__ const ForwardParams
         cute::cp_async_wait<0>();
         __syncthreads();  // Ensure K is fully loaded before computing scores
 
-        V.copy_gmem_to_smem(params, nbidx);
+        V.copy_gmem_to_smem(ctx, params, nbidx);
         cute::cp_async_fence();
 
         Score<KernelTraits> score(Q, K);
@@ -651,10 +713,10 @@ __global__ void flash_attention_fwd_kernel(__grid_constant__ const ForwardParams
         
         // Skip masking if entire block is within valid range
         // This is common when seqlen_k is a multiple of kBlockN
-        const bool need_mask = params.is_causal || (col_offset + kBlockN > params.seqlen_k);
+        const bool need_mask = params.is_causal || (col_offset + kBlockN > ctx.actual_seqlen_k);
         
         if (need_mask) {
-            score.set_mask(row_offset_base, col_offset, params.seqlen_k, params.is_causal);
+            score.set_mask(m_block_idx * kBlockM, col_offset, ctx.actual_seqlen_k, params.is_causal);
         }
         
         softmax.update(score, params.softmax_scale_log2);
@@ -663,7 +725,7 @@ __global__ void flash_attention_fwd_kernel(__grid_constant__ const ForwardParams
         __syncthreads();  // Ensure V is fully loaded before accumulation
 
         if (nbidx + 1 < n_block_max) {
-            K.copy_gmem_to_smem(params, nbidx + 1);
+            K.copy_gmem_to_smem(ctx, params, nbidx + 1);
             cute::cp_async_fence();
         }
 
@@ -679,29 +741,7 @@ __global__ void flash_attention_fwd_kernel(__grid_constant__ const ForwardParams
     // Ensure all threads have written to shared memory before reading
     __syncthreads();
         
-    O.copy_smem_to_gmem(params);
-}
-
-template<typename KernelTraits>
-void compute_attn(const ForwardParams& params, cudaStream_t stream) {
-    const int m_blocks = cute::ceil_div(params.seqlen_q, KernelTraits::kBlockM);
-
-    dim3 grid(m_blocks, params.heads, params.batch);
-    dim3 block(KernelTraits::kNThreads);
-
-    // Set shared memory limit for large head dimensions
-    // SM80 (Ampere) supports up to 164KB per SM, but 48KB per block by default
-    // For head_dim >= 128, we need more than 48KB
-    constexpr int smem_size = KernelTraits::smem_size;
-    if constexpr (smem_size > 48 * 1024) {
-        cudaFuncSetAttribute(
-            flash_attention_fwd_kernel<KernelTraits>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            smem_size
-        );
-    }
-
-    flash_attention_fwd_kernel<KernelTraits><<<grid, block, smem_size, stream>>>(params);
+    O.copy_smem_to_gmem(ctx, params);
 }
 
 } // namespace mfa

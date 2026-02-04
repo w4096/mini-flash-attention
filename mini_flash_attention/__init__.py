@@ -4,8 +4,10 @@ __version__ = "0.1.0"
 
 from mini_flash_attention.interface import (
     flash_attn_func,
+    flash_attn_varlen_func,
 )
 
 __all__ = [
     "flash_attn_func",
+    "flash_attn_varlen_func",
 ]

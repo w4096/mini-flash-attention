@@ -1,4 +1,4 @@
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import torch
 import mini_flash_attention._C as _C  # type: ignore[import-not-found]
 
@@ -8,26 +8,116 @@ def flash_attn_func(
     k: torch.Tensor, 
     v: torch.Tensor,
     causal: bool = False,
+    window_size: Tuple[int, int] = (-1, -1),
 ) -> torch.Tensor:
     """
     Mini Flash Attention forward pass.
     
-    Args:
-        q: Query tensor (batch, seqlen_q, heads, head_dim)
-        k: Key tensor (batch, seqlen_k, heads_k, head_dim)
-        v: Value tensor (batch, seqlen_k, heads_k, head_dim)
-        causal: Whether to apply causal mask (default: False)
+    Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
+    than Q. Note that the number of heads in Q must be divisible by the number of heads in K, V.
+    For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
+    0 of K, V, and head 3, 4, 5 of Q will attention to head 1 of K, V.
+
+    If causal=True, the causal mask is aligned to the bottom right corner of the attention matrix.
+    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = masked out) is:
+        1 1 1 1 0
+        1 1 1 1 1
+    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    If the row of the mask is all zero, the output will be zero.
+
+    If window_size != (-1, -1), implements sliding window local attention. Query at position i
+    will only attend to keys between
+    [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] inclusive.
     
-    Returns:
-        Output tensor (batch, seqlen_q, heads, head_dim)
+    Arguments:
+        q: (batch_size, seqlen_q, nheads, headdim)
+        k: (batch_size, seqlen_k, nheads_k, headdim)
+        v: (batch_size, seqlen_k, nheads_k, headdim)
+        causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
     
-    Example:
-        >>> q = torch.randn(1, 4096, 8, 128, device='cuda', dtype=torch.float16)
-        >>> k = torch.randn(1, 4096, 8, 128, device='cuda', dtype=torch.float16)
-        >>> v = torch.randn(1, 4096, 8, 128, device='cuda', dtype=torch.float16)
+    Return:
+        out: (batch_size, seqlen_q, nheads, headdim).
+    
+    Examples:
+        >>> q = torch.randn(2, 1024, 8, 128, device='cuda', dtype=torch.float16)
+        >>> k = torch.randn(2, 1024, 8, 128, device='cuda', dtype=torch.float16)
+        >>> v = torch.randn(2, 1024, 8, 128, device='cuda', dtype=torch.float16)
         >>> out = flash_attn_func(q, k, v, causal=True)
     """
-    result: List[torch.Tensor] = _C.mini_flash_attention_forward(q, k, v, causal)
-    return result[0]
+    return _C.mini_flash_attention_forward(
+        q, k, v, None, causal, window_size[0], window_size[1]
+    )
 
 
+def flash_attn_varlen_func(
+    q: torch.Tensor,
+    k: torch.Tensor, 
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    causal: bool = False,
+    window_size: Tuple[int, int] = (-1, -1),
+) -> torch.Tensor:
+    """
+    Mini Flash Attention forward pass for variable-length sequences (continuous batching).
+    
+    Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
+    than Q. Note that the number of heads in Q must be divisible by the number of heads in K, V.
+    For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
+    0 of K, V, and head 3, 4, 5 of Q will attention to head 1 of K, V.
+
+    If causal=True, the causal mask is aligned to the bottom right corner of the attention matrix.
+    For each sequence in the batch, if seqlen_q = 2 and seqlen_k = 5, the causal mask 
+    (1 = keep, 0 = masked out) is:
+        1 1 1 1 0
+        1 1 1 1 1
+    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    If the row of the mask is all zero, the output will be zero.
+
+    If window_size != (-1, -1), implements sliding window local attention. Query at position i
+    will only attend to keys between
+    [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] inclusive.
+    
+    Arguments:
+        q: (total_q, nheads, headdim), where total_q = sum of all sequence lengths in the batch.
+        k: (total_k, nheads_k, headdim), where total_k = sum of all sequence lengths in the batch.
+        v: (total_k, nheads_k, headdim), where total_k = sum of all sequence lengths in the batch.
+        cu_seqlens_q: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
+           of the sequences in the batch, used to index into q.
+        cu_seqlens_k: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
+           of the sequences in the batch, used to index into kv.
+        max_seqlen_q: int. Maximum query sequence length in the batch.
+        max_seqlen_k: int. Maximum key/value sequence length in the batch.
+        causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+    
+    Return:
+        out: (total_q, nheads, headdim).
+    
+    Examples:
+        >>> # Variable-length batch with different sequence lengths
+        >>> seqlens = [128, 256, 512]
+        >>> total_q = sum(seqlens)
+        >>> q = torch.randn(total_q, 8, 64, device='cuda', dtype=torch.float16)
+        >>> k = torch.randn(total_q, 8, 64, device='cuda', dtype=torch.float16)
+        >>> v = torch.randn(total_q, 8, 64, device='cuda', dtype=torch.float16)
+        >>> cu_seqlens = torch.tensor([0] + seqlens, dtype=torch.int32, device='cuda').cumsum(0, dtype=torch.int32)
+        >>> max_seqlen = max(seqlens)
+        >>> out = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, causal=True)
+    """
+    return _C.mini_flash_attention_varlen_forward(
+        q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal, window_size[0], window_size[1]
+    )

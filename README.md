@@ -115,7 +115,7 @@ Max difference between torch and mini-flash-attn: 3.814697265625e-06
 ## TODO
 
 - [x] Implement causal masking
-- [ ] Support variable sequence lengths
+- [x] Support variable sequence lengths
 - [ ] Support KV cache
 - [ ] Add more kernel configurations for different head dimensions
 

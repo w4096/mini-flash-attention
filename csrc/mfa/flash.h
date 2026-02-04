@@ -30,6 +30,8 @@ struct ForwardParams {
     index_t o_row_stride;
 
     bool is_causal;
+    int window_size_left;
+    int window_size_right;
 
     int heads;          // number of heads
     int kv_heads;       // number of key/value heads
@@ -45,7 +47,11 @@ struct ForwardParams {
 
     bool is_bf16;
 
-    void *reserved[8];
+    // For variable-length sequences (continuous batching)
+    int* __restrict__ cu_seqlens_q;  // cumulative sequence lengths for Q [batch+1]
+    int* __restrict__ cu_seqlens_k;  // cumulative sequence lengths for K [batch+1]
+    int max_seqlen_q;  // maximum sequence length in the batch for Q
+    int max_seqlen_k;  // maximum sequence length in the batch for K
 };
 
 
