@@ -17,7 +17,6 @@ def torch_attention(q, k, v, causal=False):
     return o.transpose(1, 2)
 
 def mini_flash_attention(q, k, v, causal=False):
-    # 新的接口直接返回 Tensor，不再返回 tuple
     return mini_flash_attn_func(q, k, v, causal=causal)
     
 def test_flash_attn_forward():

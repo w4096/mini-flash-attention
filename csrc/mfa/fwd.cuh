@@ -24,9 +24,8 @@ class Query {
     using GmemTensor = decltype(make_tensor(make_gmem_ptr<Element>(nullptr), GmemLayout{}));
 
     explicit __device__ Query(const ForwardParams& params, Element* smem) {
-        const size_t offset = blockIdx.z * params.q_batch_stride + blockIdx.y * params.q_head_stride +
-                              blockIdx.x * KernelTraits::kBlockM * params.q_row_stride;
-        Element* gmem_ptr = static_cast<Element*>(params.q_ptr) + offset;
+        const size_t offset = get_gmem_offset(params, blockIdx.z, blockIdx.y, blockIdx.x * KernelTraits::kBlockM);
+        auto gmem_ptr = static_cast<Element*>(params.q_ptr) + offset;
         const auto layout = make_layout(GmemShape{}, make_stride(params.q_row_stride, _1{}));
         gmem_ = make_tensor(make_gmem_ptr<Element>(gmem_ptr), layout);
 
@@ -56,6 +55,11 @@ class Query {
     }
 
  private:
+
+    __device__ index_t get_gmem_offset(const ForwardParams& params, int batch, int head, int row) const {
+        return batch * params.q_batch_stride + head * params.q_head_stride + row * params.q_row_stride;
+    };
+
     SmemTensor smem_;
     GmemTensor gmem_;
 };
@@ -75,21 +79,18 @@ class Key {
     using GmemTensor = decltype(make_tensor(make_gmem_ptr<Element>(nullptr), make_layout(GmemShape{}, GmemStride{})));
 
     explicit __device__ Key(const ForwardParams& params, Element* smem) {
-        const size_t offset =
-            blockIdx.z * params.k_batch_stride + (blockIdx.y / params.kv_group_size) * params.k_head_stride;
-        Element* gmem_ptr = static_cast<Element*>(params.k_ptr) + offset;
+        const size_t offset = get_gmem_offset(params, blockIdx.z, blockIdx.y, 0);
+
+        auto gmem_ptr = static_cast<Element*>(params.k_ptr) + offset;
         const auto layout = make_layout(GmemShape{}, make_stride(params.k_row_stride, _1{}));
         gmem_ = make_tensor(make_gmem_ptr<Element>(gmem_ptr), layout);
 
         smem_ = make_tensor(make_smem_ptr(smem), SmemLayout{});
     }
 
-    __device__ void advance(const ForwardParams& params) {
-        const size_t offset = KernelTraits::kBlockN * params.k_row_stride;
-        gmem_ = make_tensor(make_gmem_ptr<Element>(gmem_.data().get() + offset), gmem_.layout());
-    }
+    __device__ void copy_gmem_to_smem(const ForwardParams& params, int nbidx) {
+        set_gmem_address(params, nbidx);
 
-    __device__ void copy_gmem_to_smem() {
         for (unsigned int i = 0; i < size(smem_); i += KernelTraits::kBlockSize * 8) {
             auto idx = i + threadIdx.x * 8;
             auto row = idx / size<1>(smem_);
@@ -112,6 +113,18 @@ class Key {
 
 
  private:
+    __forceinline__ __device__ void set_gmem_address(const ForwardParams& params, int nbidx) {
+        int row = nbidx * KernelTraits::kBlockN;
+        const size_t offset = get_gmem_offset(params, blockIdx.z, blockIdx.y, row);
+        auto gmem_ptr = static_cast<Element*>(params.k_ptr) + offset;
+        gmem_ = make_tensor(make_gmem_ptr<Element>(gmem_ptr), gmem_.layout());
+    }
+
+    __device__ index_t get_gmem_offset(const ForwardParams& params, int batch, int head, int row) const {
+        head = head / params.kv_group_size;
+        return batch * params.k_batch_stride + head * params.k_head_stride + row * params.k_row_stride;
+    };
+
     SmemTensor smem_;
     GmemTensor gmem_;
 };
@@ -128,21 +141,16 @@ struct Value {
     using GmemTensor = Key<KernelTraits>::GmemTensor;
 
     __device__ explicit Value(const ForwardParams& params, Element* smem) {
-        const index_t offset =
-            blockIdx.z * params.v_batch_stride + (blockIdx.y / params.kv_group_size) * params.v_head_stride;
-        Element* gmem_ptr = static_cast<Element*>(params.v_ptr) + offset;
+        const index_t offset = get_gmem_offset(params, blockIdx.z, blockIdx.y, 0);
+        auto gmem_ptr = static_cast<Element*>(params.v_ptr) + offset;
         const auto layout = make_layout(GmemShape{}, make_stride(params.v_row_stride, _1{}));
         gmem_ = make_tensor(make_gmem_ptr<Element>(gmem_ptr), layout);
 
         smem_ = make_tensor(make_smem_ptr(smem), SmemLayout{});
     }
 
-    __device__ void advance(const ForwardParams& params) {
-        const size_t offset = KernelTraits::kBlockN * params.v_row_stride;
-        gmem_ = make_tensor(make_gmem_ptr<Element>(gmem_.data().get() + offset), gmem_.layout());
-    }
-
-    __device__ void copy_gmem_to_smem() {
+    __device__ void copy_gmem_to_smem(const ForwardParams& params, int nbidx) {
+        set_gmem_address(params, nbidx);
         for (unsigned int i = 0; i < size(smem_); i += KernelTraits::kBlockSize * 8) {
             auto idx = i + threadIdx.x * 8;
             auto row = idx / size<1>(smem_);
@@ -165,6 +173,19 @@ struct Value {
     }
 
  private:
+
+    __forceinline__ __device__ void set_gmem_address(const ForwardParams& params, int nbidx) {
+        int row = nbidx * KernelTraits::kBlockN;
+        const size_t offset = get_gmem_offset(params, blockIdx.z, blockIdx.y, row);
+        auto gmem_ptr = static_cast<Element*>(params.v_ptr) + offset;
+        gmem_ = make_tensor(make_gmem_ptr<Element>(gmem_ptr), gmem_.layout());
+    }
+
+    __device__ index_t get_gmem_offset(const ForwardParams& params, int batch, int head, int row) const {
+        head = head / params.kv_group_size;
+        return batch * params.v_batch_stride + head * params.v_head_stride + row * params.v_row_stride;
+    };
+
     SmemTensor smem_;
     GmemTensor gmem_;
 };
@@ -211,14 +232,14 @@ class Score {
                 uint32_t b0, b1;
 
                 // the address within 16x16 tile of A matrix
-                int a_row = m_smem_idx + (lane % 16);
-                int a_col = k_smem_idx + (lane / 16) * 8;
+                const int a_row = m_smem_idx + (lane % 16);
+                const int a_col = k_smem_idx + (lane / 16) * 8;
                 const auto a_addr = reinterpret_cast<const uint128_t*>(&query.smem(a_row, a_col));
                 cute::SM75_U32x4_LDSM_N::copy(*a_addr, a0, a1, a2, a3);
 
                 // the address within 16x8 tile of B matrix
-                int b_row = n_smem_idx + (lane % 8);
-                int b_col = k_smem_idx + (lane / 8) * 8;
+                const int b_row = n_smem_idx + (lane % 8);
+                const int b_col = k_smem_idx + (lane / 8) * 8;
                 const auto b_addr = reinterpret_cast<const uint128_t*>(&key.smem(b_row, b_col));
                 cute::SM75_U32x2_LDSM_N::copy(*b_addr, b0, b1);
 
@@ -272,7 +293,6 @@ class Score {
         // Each thread handles 2 rows (row and row+8) in a 16x8 tile
         const int m_base = row_offset + warp_idx * MMA_m;
         
-        #pragma unroll
         for (int n = 0; n < n_tiles; n++) {
             const int n_base = col_offset + n * MMA_n;
             
@@ -338,14 +358,15 @@ class Softmax {
 
         // exponentiate the scores with updated row_max
         float sum_0 = 0.0f, sum_1 = 0.0f;
-        float max_0 = row_max_(0) * softmax_scale_log2;
-        float max_1 = row_max_(1) * softmax_scale_log2;
+        const float max_scaled_0 = row_max_(0) * softmax_scale_log2;
+        const float max_scaled_1 = row_max_(1) * softmax_scale_log2;
+
         #pragma unroll
         for (int n = 0; n < size<0>(score.score()); n++) {
-            score(n, 0) = exp2f(score(n, 0) * softmax_scale_log2 - max_0);
-            score(n, 1) = exp2f(score(n, 1) * softmax_scale_log2 - max_0);
-            score(n, 2) = exp2f(score(n, 2) * softmax_scale_log2 - max_1);
-            score(n, 3) = exp2f(score(n, 3) * softmax_scale_log2 - max_1);
+            score(n, 0) = exp2f(score(n, 0) * softmax_scale_log2 - max_scaled_0);
+            score(n, 1) = exp2f(score(n, 1) * softmax_scale_log2 - max_scaled_0);
+            score(n, 2) = exp2f(score(n, 2) * softmax_scale_log2 - max_scaled_1);
+            score(n, 3) = exp2f(score(n, 3) * softmax_scale_log2 - max_scaled_1);
             sum_0 += score(n, 0) + score(n, 1);
             sum_1 += score(n, 2) + score(n, 3);
         }
@@ -413,9 +434,8 @@ struct Output {
         rmem_ = make_tensor<ElementAccum>(RmemLayout{});
         cute::fill(rmem_, .0f);
 
-        const index_t offset = blockIdx.z * params.o_batch_stride + blockIdx.y * params.o_head_stride +
-                               blockIdx.x * KernelTraits::kBlockM * params.o_row_stride;
-        Element* gmem_ptr = static_cast<Element*>(params.o_ptr) + offset;
+        const index_t offset = get_gmem_offset(params, blockIdx.z, blockIdx.y, blockIdx.x * KernelTraits::kBlockM);
+        auto gmem_ptr = static_cast<Element*>(params.o_ptr) + offset;
         auto layout = make_layout(GmemShape{}, make_stride(params.o_row_stride, _1{}));
         gmem_ = make_tensor(make_gmem_ptr(gmem_ptr), layout);
 
@@ -549,6 +569,10 @@ struct Output {
 
     
  private:
+    __device__ index_t get_gmem_offset(const ForwardParams& params, int batch, int head, int row) const {
+        return batch * params.o_batch_stride + head * params.o_head_stride + row * params.o_row_stride;
+    };
+
     RmemTensor rmem_;
     GmemTensor gmem_;
     SmemTensor smem_;
@@ -589,7 +613,7 @@ __global__ void flash_attention_fwd_kernel(__grid_constant__ const ForwardParams
         : n_blocks;
     
     Q.copy_gmem_to_smem();
-    K.copy_gmem_to_smem();
+    K.copy_gmem_to_smem(params, n_block_min);
     cute::cp_async_fence();
 
 
@@ -598,8 +622,7 @@ __global__ void flash_attention_fwd_kernel(__grid_constant__ const ForwardParams
         __syncthreads();  // Ensure K is fully loaded before computing scores
 
         // Load next V block into shared memory
-        V.copy_gmem_to_smem();
-        V.advance(params);
+        V.copy_gmem_to_smem(params, nbidx);
         cute::cp_async_fence();
 
         Score<KernelTraits> score(Q, K);
@@ -617,8 +640,7 @@ __global__ void flash_attention_fwd_kernel(__grid_constant__ const ForwardParams
         __syncthreads();  // Ensure V is fully loaded before accumulation
 
         if (nbidx + 1 < n_block_max) {
-            K.advance(params);
-            K.copy_gmem_to_smem();
+            K.copy_gmem_to_smem(params, nbidx + 1);
             cute::cp_async_fence();
         }
 

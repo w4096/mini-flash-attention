@@ -31,15 +31,21 @@ The implementation follows the Flash Attention v2 algorithm with these key compo
 - GCC/G++ with C++20 support
 - NVIDIA GPU with Compute Capability 8.0+ (Ampere or newer)
 
-### Build from Source
+### Recommended Setup
 
 ```bash
 git clone https://github.com/w4096/mini-flash-attention.git
 cd mini-flash-attention
 git submodule update --init --recursive
 
-# Install Python package
-python setup.py install
+# Build the extension
+python setup.py build
+
+# set path to the built extension (replace XXX with the real path)
+export PYTHONPATH=$(pwd)/build/lib.XXX
+
+# run benchmarks
+python ./benchmark/run.py
 ```
 
 ## Usage
@@ -64,26 +70,15 @@ output = mini_flash_attn_func(q, k, v)[0]
 
 ## Performance
 
-Benchmarked on NVIDIA GPU with the following configuration:
+Benchmarked on NVIDIA GPU by running the benchmark script in `benchmark/run.py`.
 
-| Parameter | Value |
-|-----------|-------|
-| Batch Size | 10 |
-| Sequence Length | 4096 |
-| Head Dimension | 128 |
-| Number of Heads | 28 |
-
-by running the benchmark script in `benchmark/run.py`.
-
-### Timing Results
+Here are the results for a forward pass with `batch_size=10`, `seqlen=4096`, `dim=128`, and `heads=28`:
 
 | Implementation | CPU Time | CUDA Time |
 |----------------|----------|-----------|
 | **Mini Flash Attention** | 41.606ms | **41.547ms** |
 | PyTorch Attention | 44.098ms | 42.882ms |
 | Flash Attention (official) | 43.890ms | 42.692ms |
-
-### Accuracy Comparison
 
 All implementations produce nearly identical results:
 
@@ -92,11 +87,6 @@ Max difference between mini-flash-attn and flash-attn: 3.814697265625e-06
 Max difference between torch and flash-attn: 3.814697265625e-06
 Max difference between torch and mini-flash-attn: 3.814697265625e-06
 ```
-
-**Key Takeaways:**
-- Mini Flash Attention achieves **competitive performance** with the official implementation
-- Numerical accuracy is within expected FP16 precision bounds
-- ~6% speedup compared to standard PyTorch attention
 
 ## Technical Details
 
@@ -121,55 +111,8 @@ Max difference between torch and mini-flash-attn: 3.814697265625e-06
 - **Shared Memory**: ~24KB per block
 - **MMA Shape**: 16x8x16 (M x N x K)
 
-## Project Structure
 
-```
-mini-flash-attention/
-├── csrc/
-│   ├── api.cpp                 # Python binding entry point
-│   └── mfa/
-│       ├── api.cpp             # Forward pass API
-│       ├── api.h
-│       ├── flash.cu            # Kernel launcher
-│       ├── flash.h             # Forward parameters
-│       ├── fwd.cuh             # Main kernel implementation
-│       ├── traits.h            # Kernel configuration
-│       └── utils.cuh           # Utility functions
-├── mini_flash_attention/
-│   ├── __init__.py
-│   └── interface.py            # PyTorch custom op interface
-├── tests/
-│   └── test.py                 # Accuracy and performance tests
-├── 3rd/
-│   └── cutlass/                # Cutlass library (submodule)
-├── setup.py
-└── README.md
-```
-
-## Limitations
-
-- **Causal Masking**: Not currently implemented
-- **Dropout**: Not supported
-- **Compute Capability**: Requires SM 8.0+ (Ampere architecture or newer)
-- **GQA/MQA**: Grouped-query attention support is basic
-
-## Development
-
-### Running Tests
-
-```bash
-python tests/test.py
-```
-
-### Building with Debug Info
-
-```bash
-python setup.py build --debug
-```
-
-## Contributing
-
-Contributions are welcome! Areas for improvement:
+## TODO
 
 - [x] Implement causal masking
 - [ ] Support variable sequence lengths
@@ -181,9 +124,6 @@ Contributions are welcome! Areas for improvement:
 - [Flash Attention v2 Paper](https://arxiv.org/abs/2307.08691) (Dao, 2023)
 - [Official Flash Attention Implementation](https://github.com/Dao-AILab/flash-attention)
 
-## License
-
-MIT License - see LICENSE file for details
 
 ## Acknowledgments
 
