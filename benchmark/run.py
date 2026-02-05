@@ -13,20 +13,20 @@ def torch_attention(q, k, v):
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)
     
-    o = torch.nn.functional.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+    o = torch.nn.functional.scaled_dot_product_attention(q, k, v)
     return o.transpose(1, 2)
 
 def mini_flash_attention(q, k, v):
-    # 新的接口直接返回 Tensor，不再返回 tuple
     return mini_flash_attn_func(q, k, v)
     
 def test_flash_attn_forward():
 
     # Define input parameters
-    batch_size = 1
-    seqlen = 4096 * 2
+    batch_size = 10
+    seqlen = 4096
     dim = 128
-    heads = 1
+    heads = 28
+    
 
     # Create random tensors for q, k, v
     q = torch.randn((batch_size, seqlen, heads, dim), device='cuda', dtype=torch.half)
@@ -38,6 +38,12 @@ def test_flash_attn_forward():
     q = torch.nn.functional.normalize(q, dim=-1)
     k = torch.nn.functional.normalize(k, dim=-1)
     v = torch.nn.functional.normalize(v, dim=-1)
+
+
+    for _ in range(3):
+        mini_flash_attention(q, k, v)
+        torch_attention(q, k, v)
+        flash_attention(q, k, v)
 
 
     with torch.profiler.profile() as prof:
