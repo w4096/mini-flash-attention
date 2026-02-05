@@ -293,7 +293,7 @@ class Softmax {
         cute::fill(row_max_, -cuda::std::numeric_limits<ElementAccum>::infinity());
     }
 
-    __device__ void update(Score<KernelTraits>& score, float softmax_scale_log2, bool first) {
+    __device__ void update(Score<KernelTraits>& score, float softmax_scale_log2) {
         // compute max per row
         auto new_row_max = cute::make_tensor<ElementAccum>(RowMaxTensorLayout{});
         score.compute_row_max(new_row_max);
@@ -320,13 +320,8 @@ class Softmax {
         }
 
         // update exp sum with rescaling
-        if (first) {
-            expsum_(0) = sum_0;
-            expsum_(1) = sum_1;
-        } else {
-            expsum_(0) = __fmaf_rn(expsum_(0), rescale_(0), sum_0);
-            expsum_(1) = __fmaf_rn(expsum_(1), rescale_(1), sum_1);
-        }
+        expsum_(0) = __fmaf_rn(expsum_(0), rescale_(0), sum_0);
+        expsum_(1) = __fmaf_rn(expsum_(1), rescale_(1), sum_1);
     }
 
     __device__ void reduce_sum_expsum() {
@@ -393,7 +388,7 @@ struct Output {
 
     template<typename Tensor0>
     __device__ void accum(const Softmax<KernelTraits>::RescaleTensor& rescale, Tensor0 const& score,
-                          const Value<KernelTraits>& value, bool first) {
+                          const Value<KernelTraits>& value) {
         
         for (int n = 0; n < n_tiles; n++) {
             float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
@@ -437,17 +432,10 @@ struct Output {
                 // clang-format on
             }
 
-            if (first) {
-                rmem_(n, 0) = c0;
-                rmem_(n, 1) = c1;
-                rmem_(n, 2) = c2;
-                rmem_(n, 3) = c3;
-            } else {
-                rmem_(n, 0) = __fmaf_rn(rmem_(n, 0), rescale(0), c0);
-                rmem_(n, 1) = __fmaf_rn(rmem_(n, 1), rescale(0), c1);
-                rmem_(n, 2) = __fmaf_rn(rmem_(n, 2), rescale(1), c2);
-                rmem_(n, 3) = __fmaf_rn(rmem_(n, 3), rescale(1), c3);
-            }
+            rmem_(n, 0) = __fmaf_rn(rmem_(n, 0), rescale(0), c0);
+            rmem_(n, 1) = __fmaf_rn(rmem_(n, 1), rescale(0), c1);
+            rmem_(n, 2) = __fmaf_rn(rmem_(n, 2), rescale(1), c2);
+            rmem_(n, 3) = __fmaf_rn(rmem_(n, 3), rescale(1), c3);
         }
     }
 
@@ -539,27 +527,32 @@ __global__ void flash_attention_fwd_kernel(__grid_constant__ const ForwardParams
     Softmax<KernelTraits> softmax{};
 
     Q.copy_gmem_to_smem();
+    K.copy_gmem_to_smem();
+    K.advance(params);
     cute::cp_async_fence();
 
     constexpr int kBlockN = KernelTraits::kBlockN;
     const int n_blocks = params.seqlen_k / kBlockN;
-    for (int nbi = 0; nbi < n_blocks; nbi++) {
-        K.copy_gmem_to_smem();
-        cute::cp_async_fence();
-
+    for (int nbidx = 0; nbidx < n_blocks; nbidx++) {
         cute::cp_async_wait<0>();
+        __syncthreads();
 
         V.copy_gmem_to_smem();
+        V.advance(params);
         cute::cp_async_fence();
 
         Score<KernelTraits> score(Q, K);
-        softmax.update(score, params.softmax_scale_log2, nbi == 0);
-
+        softmax.update(score, params.softmax_scale_log2);
         cute::cp_async_wait<0>();
-        O.accum(softmax.rescale(), score.score(), V, nbi == 0);
+        __syncthreads();
 
-        K.advance(params);
-        V.advance(params);
+        if (nbidx + 1 < n_blocks) {
+            K.copy_gmem_to_smem();
+            K.advance(params);
+            cute::cp_async_fence();
+        }
+
+        O.accum(softmax.rescale(), score.score(), V);
     }
 
     softmax.reduce_sum_expsum();
