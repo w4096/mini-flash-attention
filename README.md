@@ -1,6 +1,8 @@
 # Mini Flash Attention
 
-A minimal, educational implementation of Flash Attention v2 in CUDA. This project demonstrates the core concepts of Flash Attention with a focus on code clarity and understanding.
+A minimal, educational implementation of Flash Attention v2 in CUDA. This project demonstrates the core concepts of Flash Attention with a focus on code clarity and understanding. Currently, it only supports forward pass with causal masking and variable-length sequences.
+
+[mini-flash-attention v0.1](https://github.com/w4096/mini-flash-attention/tree/v0.1) is a simplified version that omits some advanced features like causal masking and variable-length sequences. If you are not familiar with Flash Attention, start with this version to grasp the fundamentals.
 
 ## What's This?
 
@@ -16,19 +18,21 @@ Flash Attention is a fast and memory-efficient attention algorithm that makes tr
 ## Getting Started
 
 **Requirements:**
+
 - CUDA 11.8+ (tested on CUDA 12.8)
 - Python 3.8+
 - PyTorch 2.0+
 - NVIDIA Ampere GPU or newer (SM 80+)
 
 **Build:**
+
 ```bash
 git clone https://github.com/w4096/mini-flash-attention.git
 cd mini-flash-attention
 git submodule update --init --recursive
 
 python setup.py build
-export PYTHONPATH=$(pwd)/build/lib.linux-x86_64-cpython-312
+export PYTHONPATH=$(pwd)/build/lib.linux-x86_64-cpython-312 # adjust for your Python version
 ```
 
 ## Quick Example
@@ -93,6 +97,7 @@ The implementation splits Q, K, V into tiles and processes them in chunks:
 4. Accumulate the output on-the-fly
 
 This approach keeps memory usage low while being fast thanks to:
+
 - CUDA Tensor Cores for matrix multiplications
 - Shared memory tiling to reduce bandwidth
 - Async memory copies to overlap computation
@@ -105,7 +110,6 @@ The code uses NVIDIA CuTe library for clean tensor operations.
 - [x] Implement causal masking
 - [x] Support variable sequence lengths
 - [ ] Support KV cache
-- [ ] Add more kernel configurations for different head dimensions
 
 ## References
 
