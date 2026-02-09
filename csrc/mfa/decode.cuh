@@ -333,37 +333,6 @@ class Score {
         return score_(idx);
     }
 
-    // If is_causal=true: masks where col > row OR col >= seqlen_k
-    // If is_causal=false: masks only where col >= seqlen_k
-    // __device__ void set_mask(int row_offset, int col_offset, int seqlen_k, bool is_causal) {
-    //     const int warp_idx = threadIdx.x / 32;
-    //     const int lane = threadIdx.x % 32;
-        
-    //     // Each thread handles 2 rows (row and row+8) in a 16x8 tile
-    //     const int m_base = row_offset + warp_idx;
-        
-    //     for (int n = 0; n < 1; n++) {
-    //         const int n_base = col_offset;
-            
-    //         // For each of the 4 elements this thread owns in the tile
-    //         // Elements (0,1) are for row m_base + (lane/4)
-    //         // Elements (2,3) are for row m_base + (lane/4) + 8
-            
-    //         int row_0 = m_base + (lane / 4);
-    //         int row_1 = m_base + (lane / 4) + 8;
-            
-    //         // Each element covers 2 columns
-    //         int col_0 = n_base + (lane % 4) * 2;
-    //         int col_1 = col_0 + 1;
-            
-    //         // Apply unified mask
-    //         // Unified mask: check causal condition OR seqlen condition
-    //         if ((is_causal && col_0 > row_0) || col_0 >= seqlen_k) score_(0) = -INFINITY;
-    //         if ((is_causal && col_1 > row_0) || col_1 >= seqlen_k) score_(1) = -INFINITY;
-    //         if ((is_causal && col_0 > row_1) || col_0 >= seqlen_k) score_(2) = -INFINITY;
-    //         if ((is_causal && col_1 > row_1) || col_1 >= seqlen_k) score_(3) = -INFINITY;
-    //     }
-    // }
 
  private:
     ScoreTensor score_;
@@ -533,7 +502,6 @@ __global__ void flash_attention_fwd_split_kv_kernel(__grid_constant__ const Forw
     using ElementAccum = typename KernelTraits::ElementAccum;
     using namespace decode;
 
-    constexpr int kBlockN = KernelTraits::kBlockN;
     constexpr int kHeadDim = KernelTraits::kHeadDim;
     
     Context<KernelTraits> ctx(params);
@@ -549,14 +517,11 @@ __global__ void flash_attention_fwd_split_kv_kernel(__grid_constant__ const Forw
     offset += size(typename Key<KernelTraits>::SmemLayout{});
     Value<KernelTraits> V(ctx, params, smem_ptr + offset);
 
-    Output<KernelTraits, Split> O(ctx, params); // reuse the same smem space
+    Output<KernelTraits, Split> O(ctx, params);
 
     // softmax keep track of row max and exp sum
     Softmax<KernelTraits> softmax{};
 
-    // blocks in N dimension
-    const int n_blocks = cute::ceil_div(ctx.actual_seqlen_k, kBlockN);
-    
 
     Q.copy_gmem_to_smem(ctx, params);
     K.copy_gmem_to_smem(ctx, params, ctx.n_block_min);
@@ -597,6 +562,7 @@ __global__ void flash_attention_fwd_split_kv_kernel(__grid_constant__ const Forw
     }
     __syncthreads();
 
+    // get global max and exp sum across warps
     float gloabl_max_val = -INFINITY;
     for (int i = 0; i < KernelTraits::kNWarps; i++) {
         gloabl_max_val = max(gloabl_max_val, warp_max_val[i]);
@@ -668,8 +634,8 @@ __global__ void flash_attention_fwd_split_kv_combine_kernel(__grid_constant__ co
     float* o_output = static_cast<float*>(params.o_ptr);
 
 
-    auto o_accum_layout = make_layout(make_shape(params.num_splits, params.batch, params.heads, Int<kHeadDim>{}), LayoutRight{});
-    auto o_accum_tensor = make_tensor(make_gmem_ptr<float>(o_accum), o_accum_layout);
+    auto o_accum_gmem_layout = make_layout(make_shape(params.num_splits, params.batch, params.heads, Int<kHeadDim>{}), LayoutRight{});
+    auto o_accum_gmem_tensor = make_tensor(make_gmem_ptr<float>(o_accum), o_accum_gmem_layout);
 
     auto o_accum_smem_layout = make_layout(make_shape(num_splits, Int<kHeadDim>{}), make_stride(Int<kHeadDim>{}, _1{}));
     auto o_accum_smem_tensor = make_tensor(make_smem_ptr<float>(smem_), o_accum_smem_layout);
@@ -681,23 +647,27 @@ __global__ void flash_attention_fwd_split_kv_combine_kernel(__grid_constant__ co
     auto lse_smem_tensor = make_tensor(make_smem_ptr<float>(smem_ + KernelTraits::kHeadDim * num_splits), lse_smem_layout);
 
     // copy accumulated outputs from global memory to shared memory for reduction
-    for (int split = 0; split < num_splits; split++) {
-        for (int d = 0; d < kHeadDim; d += blockDim.x) {
-            int col = d + threadIdx.x;
-            if (col < kHeadDim) {
-                o_accum_smem_tensor(split, col) = o_accum_tensor(split, batch_idx, head_idx, col);
-            }
+    // TODO: async copy
+    for (int i = 0; i < num_splits * kHeadDim; i += KernelTraits::kBlockSize * 4) {
+        auto idx = i + threadIdx.x * 4;
+        const auto row = idx / kHeadDim;
+        const auto col = idx % kHeadDim;
+
+        bool valid = row < num_splits && col < kHeadDim;
+        if (valid) {
+            auto dst_ptr = reinterpret_cast<float4*>(&o_accum_smem_tensor(row, col));
+            auto src_ptr = reinterpret_cast<float4*>(&o_accum_gmem_tensor(row, batch_idx, head_idx, col));
+            SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<float4>::copy(*src_ptr, *dst_ptr, true);
         }
+    }
+    cute::cp_async_fence();
+
+    for (int idx = threadIdx.x; idx < num_splits; idx += blockDim.x) {
+        lse_smem_tensor(idx) = lse_gmem_tensor(idx, batch_idx, head_idx);
     }
 
-    for (int i = 0; i < num_splits; i += blockDim.x) {
-        int idx = i + threadIdx.x;
-        if (idx < num_splits) {
-            lse_smem_tensor(idx) = lse_gmem_tensor(idx, batch_idx, head_idx);
-        }
-    }
+    cute::cp_async_wait<0>(); // ensure all data is in shared memory before we start computing the final output
     __syncthreads();
-
 
     float global_lse = 0;
     for (int split = 0; split < num_splits; split++) {
