@@ -1,4 +1,4 @@
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Union
 import torch
 import mini_flash_attention._C as _C  # type: ignore[import-not-found]
 
@@ -17,22 +17,6 @@ def flash_attn_func(
     than Q. Note that the number of heads in Q must be divisible by the number of heads in K, V.
     For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
     0 of K, V, and head 3, 4, 5 of Q will attention to head 1 of K, V.
-
-    If causal=True, the causal mask is aligned to the bottom right corner of the attention matrix.
-    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = masked out) is:
-        1 1 1 1 0
-        1 1 1 1 1
-    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
-        0 0
-        0 0
-        0 0
-        1 0
-        1 1
-    If the row of the mask is all zero, the output will be zero.
-
-    If window_size != (-1, -1), implements sliding window local attention. Query at position i
-    will only attend to keys between
-    [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] inclusive.
     
     Arguments:
         q: (batch_size, seqlen_q, nheads, headdim)
@@ -74,22 +58,6 @@ def flash_attn_varlen_func(
     For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
     0 of K, V, and head 3, 4, 5 of Q will attention to head 1 of K, V.
 
-    If causal=True, the causal mask is aligned to the bottom right corner of the attention matrix.
-    For each sequence in the batch, if seqlen_q = 2 and seqlen_k = 5, the causal mask 
-    (1 = keep, 0 = masked out) is:
-        1 1 1 1 0
-        1 1 1 1 1
-    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
-        0 0
-        0 0
-        0 0
-        1 0
-        1 1
-    If the row of the mask is all zero, the output will be zero.
-
-    If window_size != (-1, -1), implements sliding window local attention. Query at position i
-    will only attend to keys between
-    [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] inclusive.
     
     Arguments:
         q: (total_q, nheads, headdim), where total_q = sum of all sequence lengths in the batch.
@@ -121,3 +89,37 @@ def flash_attn_varlen_func(
     return _C.mini_flash_attention_varlen_forward(
         q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal, window_size[0], window_size[1]
     )
+
+
+def flash_attn_with_kvcache(
+    q,
+    k_cache,
+    v_cache,
+    cache_seqlens: Optional[Union[int, torch.Tensor]] = None,
+    block_table: Optional[torch.Tensor] = None,
+    causal=False,
+    num_splits=0,
+):
+    """
+    Mini Flash Attention with KV cache for auto-regressive decoding.
+    
+    Arguments:
+        q: (batch_size, seqlen_q, nheads, headdim)
+        k_cache: (num_blocks, block_size, nheads_k, headdim)
+        v_cache: (num_blocks, block_size, nheads_k, headdim)
+        k: (batch_size, seqlen_k, nheads_k, headdim). If provided, used to prefill the cache.
+        v: (batch_size, seqlen_k, nheads_k, headdim). If provided, used to prefill the cache.
+        block_table: (batch_size, max_blocks_per_seq), dtype torch.int32. If provided,
+           uses the block table to index into the KV cache for non-contiguous attention.
+        causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
+        num_splits: int. Number of splits for large sequence lengths to reduce memory usage.
+    """
+    return _C.mini_flash_attention_with_kvcache(
+        q, k_cache, v_cache,
+        cache_seqlens,
+        block_table,
+        causal,
+        num_splits
+    )
+    
+    

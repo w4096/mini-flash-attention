@@ -84,6 +84,45 @@ void forward_params_init(ForwardParams& params,
     params.softmax_scale_log2 = params.softmax_scale * M_LOG2E;
 }
 
+std::tuple<at::Tensor, at::Tensor> forward_params_set_split_kv(
+    ForwardParams& params,
+    const int batch,
+    const int heads,
+    const int head_dim,
+    const int max_seqlen_k,
+    const int max_seqlen_q,
+    const int num_splits,
+    const at::TensorOptions& opts
+) {
+    const int block_n = head_dim <= 64 ? 256 : (head_dim <= 128 ? 128 : 64);
+    const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
+    const int num_m_blocks = (max_seqlen_q + 63) / 64;
+
+    params.num_splits = 2;
+    at::Tensor softmax_lse_accum;
+    at::Tensor out_accum;
+    int max_splits = 128;
+
+
+    int num_sm = 0;
+    cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, 0);
+    max_splits = std::min({max_splits, num_sm, num_n_blocks});
+
+    // set num_splits according to the number of blocks
+    int blocks = batch * heads * num_n_blocks;
+
+
+    if (params.num_splits > 1) {
+        softmax_lse_accum = torch::empty({params.num_splits, batch, heads}, opts.dtype(at::kFloat));
+        out_accum = torch::empty({params.num_splits, batch, heads, head_dim}, opts.dtype(at::kFloat));
+        params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
+        params.oaccum_ptr = out_accum.data_ptr();
+    }
+
+
+    return {softmax_lse_accum, out_accum};
+}
+
 /**
  * Flash Attention v2 forward
  *
@@ -170,7 +209,6 @@ at::Tensor flash_attention_forward(
 }
 
 
-
 at::Tensor flash_attention_varlen_forward(
     const torch::Tensor& q,  // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
     const torch::Tensor& k,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
@@ -224,5 +262,104 @@ at::Tensor flash_attention_varlen_forward(
     return out;
 }
 
+
+at::Tensor mha_fwd_kvcache(
+    const torch::Tensor& q,
+    const torch::Tensor& k_cache,
+    const torch::Tensor& v_cache,
+    const std::optional<torch::Tensor>& seqlens_k_,  // batch_size
+    const std::optional<torch::Tensor>& block_table_,
+    bool causal,
+    int num_splits
+    )
+{
+
+    torch::cuda::CUDAGuard guard(q.device());
+
+    auto dtype = q.dtype();
+    TORCH_CHECK(dtype == torch::kFloat16 || dtype == torch::kBFloat16,
+                "FlashAttention only support fp16 and bf16 data type");
+    TORCH_CHECK(k_cache.dtype() == dtype, "query and key must have the same dtype");
+    TORCH_CHECK(v_cache.dtype() == dtype, "query and value must have the same dtype");
+
+    CHECK_DEVICE(q);
+    CHECK_DEVICE(k_cache);
+    CHECK_DEVICE(v_cache);
+    TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    TORCH_CHECK(k_cache.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    TORCH_CHECK(v_cache.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+
+    torch::Tensor block_table;
+    bool paged_kv = block_table_.has_value();
+    if (paged_kv) {
+        block_table = block_table_.value();
+        CHECK_DEVICE(block_table);
+        TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must be int32");
+    }
+
+    const auto sizes = q.sizes();
+    const int batch = sizes[0];
+    const int seqlen_q = sizes[1];
+    const int num_heads = sizes[2];
+    const int head_dim = sizes[3];
+
+    TORCH_CHECK(seqlen_q == 1, "flash decoding expects seqlen_q == 1, got ", seqlen_q);
+
+    const int max_num_blocks_per_seq = !paged_kv ? 0 : block_table.size(1);
+    const int num_blocks = !paged_kv ? 0 : k_cache.size(0);
+    const int page_block_size = !paged_kv ? 1 : k_cache.size(1);
+    const int seqlen_k = paged_kv ? max_num_blocks_per_seq * page_block_size : k_cache.size(1);
+    const int kv_num_heads = k_cache.size(2);
+
+    TORCH_CHECK(k_cache.size(0) == batch, "batch size of q and k must be the same");
+    TORCH_CHECK(v_cache.size(0) == batch, "batch size of q and v must be the same");
+    TORCH_CHECK(k_cache.size(1) == seqlen_k, "sequence length of k must be the same as v");
+    TORCH_CHECK(v_cache.size(1) == seqlen_k, "sequence length of k must be the same as v");
+    TORCH_CHECK(head_dim <= 256, "head dimension must be less than or equal to 256");
+    TORCH_CHECK(num_heads % kv_num_heads == 0, "number of key/value heads must be divisible by number of query heads");
+
+
+    CHECK_SHAPE(q, batch, seqlen_q, num_heads, head_dim);
+    CHECK_SHAPE(k_cache, batch, seqlen_k, kv_num_heads, head_dim);
+    CHECK_SHAPE(v_cache, batch, seqlen_k, kv_num_heads, head_dim);
+
+    torch::Tensor out = torch::empty_like(q);
+    
+    ForwardParams params{};
+    forward_params_init(params,
+        q, k_cache, v_cache, out,
+        batch, seqlen_q, seqlen_k, num_heads, head_dim, kv_num_heads,
+        nullptr, nullptr,
+        -1, -1
+    );
+
+    if (block_table_.has_value()) {
+        auto block_table = block_table_.value();
+        CHECK_DEVICE(block_table);
+        TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must be int32");
+        params.block_table = block_table.data_ptr<int>();
+        params.block_table_batch_stride = block_table.stride(0);
+    }
+
+    if (seqlens_k_.has_value()) {
+        auto seqlens_k = seqlens_k_.value();
+        CHECK_DEVICE(seqlens_k);
+        TORCH_CHECK(seqlens_k.dtype() == torch::kInt32, "seqlens_k must be int32");
+        TORCH_CHECK(seqlens_k.numel() == batch, "seqlens_k must have the same number of elements as batch size");
+        params.seqlens_k = seqlens_k.data_ptr<int>();
+    }
+
+    auto opts = q.options();
+    auto softmax_lse = torch::empty({batch, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+
+    at::Tensor softmax_lse_accum, out_accum;
+    std::tie(softmax_lse_accum, out_accum) = forward_params_set_split_kv(params, batch, num_heads, head_dim, seqlen_k, seqlen_q, num_splits, opts);
+
+    auto stream = torch::cuda::getCurrentCUDAStream();
+    run_flash_attention_with_kv_cache(params, stream);
+    torch::cuda::stream_synchronize(stream);
+
+    return out;
+}
 
 } // namespace mfa

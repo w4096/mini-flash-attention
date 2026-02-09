@@ -52,10 +52,26 @@ struct ForwardParams {
     int* __restrict__ cu_seqlens_k;  // cumulative sequence lengths for K [batch+1]
     int max_seqlen_q;  // maximum sequence length in the batch for Q
     int max_seqlen_k;  // maximum sequence length in the batch for K
+
+
+    void * __restrict__ block_table; // optional block table for flash attention with KV caching
+    int block_table_batch_stride;
+
+
+    int* __restrict__ seqlens_k;
+
+    int num_splits; // number of splits for KV caching
+
+    // The pointer to the softmax sum.
+    void * __restrict__ softmax_lse_ptr;
+    void * __restrict__ softmax_lseaccum_ptr;
+
+    void * __restrict__ oaccum_ptr;
 };
 
 
 void run_flash_attention_forward(ForwardParams& params, cudaStream_t stream);
+void run_flash_attention_with_kv_cache(ForwardParams& params, cudaStream_t stream);
 
 
 }

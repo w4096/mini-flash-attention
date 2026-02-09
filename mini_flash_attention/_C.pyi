@@ -1,5 +1,5 @@
 import torch
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Union
 
 def mini_flash_attention_forward(
     q: torch.Tensor,
@@ -10,18 +10,6 @@ def mini_flash_attention_forward(
     window_size_left: int,
     window_size_right: int
 ) -> torch.Tensor:
-    """
-    Flash Attention forward pass.
-    
-    Args:
-        q: Query tensor of shape (batch, seqlen_q, heads, head_dim)
-        k: Key tensor of shape (batch, seqlen_k, heads_k, head_dim)
-        v: Value tensor of shape (batch, seqlen_k, heads_k, head_dim)
-        causal: Whether to apply causal mask (default: False)
-    
-    Returns:
-        List containing output tensor of shape (batch, seqlen_q, heads, head_dim)
-    """
     ...
 
 
@@ -38,18 +26,15 @@ def mini_flash_attention_varlen_forward(
     window_size_left: int,
     window_size_right: int
 ) -> torch.Tensor:
-    """
-    Mini Flash Attention forward pass for variable-length sequences.
+    ...
     
-    Args:
-        q: Query tensor (total_seqlen_q, heads, head_dim)
-        k: Key tensor (total_seqlen_k, heads_k, head_dim)
-        v: Value tensor (total_seqlen_k, heads_k, head_dim)
-        cu_seqlens_q: Cumulative sequence lengths for queries (#seq + 1)
-        cu_seqlens_k: Cumulative sequence lengths for keys/values (#seq + 1)
-        max_seqlen_q: Maximum sequence length for queries
-        max_seqlen_k: Maximum sequence length for keys/values
-        causal: Whether to apply causal mask (default: False)
-        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
-    """
+def mini_flash_attention_with_kvcache(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cache_seqlens: Optional[Union[int, torch.Tensor]],
+    block_table: Optional[torch.Tensor],
+    causal: bool,
+    num_splits: int,
+) -> torch.Tensor:
     ...

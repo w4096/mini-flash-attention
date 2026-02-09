@@ -1,6 +1,7 @@
 #include "mfa/flash.h"
 #include "mfa/traits.h"
-#include "mfa/fwd.cuh"
+#include "mfa/prefill.cuh"
+#include "mfa/decode.cuh"
 #include "mfa/static_switch.h"
 
 namespace mfa {
@@ -30,11 +31,65 @@ void run_mha_fwd(const ForwardParams& params, cudaStream_t stream) {
     kernel<<<grid, block, smem_size, stream>>>(params);
 }
 
+template<typename KernelTraits, bool Split>
+void run_mha_decode(const ForwardParams& params, cudaStream_t stream) {
+    dim3 grid, block;
+    block = dim3(KernelTraits::kNThreads);
+
+    if (params.num_splits > 1) {
+        // For multi-split decoding, we need to launch one kernel per split to handle the different KV cache pointers
+        grid = dim3(params.num_splits, params.heads, params.batch);
+    } else {
+        grid = dim3(params.heads, params.batch);
+    }
+
+    auto kernel = flash_attention_fwd_split_kv_kernel<KernelTraits, Split>;
+
+
+    using Element = typename KernelTraits::Element;
+    static const int kBlockN = KernelTraits::kBlockN;
+    static const int kHeadDim = KernelTraits::kHeadDim;
+
+    int smem_size = kHeadDim * sizeof(Element); // Q
+    smem_size += kBlockN * kHeadDim * 2 * sizeof(Element); // KV
+    smem_size +=  kHeadDim * (Split ? params.num_splits : 1) * sizeof(float); // O
+
+    smem_size += kHeadDim * 4 * sizeof(float); // softmax scores and accumulators
+
+    if (smem_size > 48 * 1024) {
+        cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size
+        );
+    }
+
+    kernel<<<grid, block, smem_size, stream>>>(params);
+
+
+    if (params.num_splits > 1) {
+        dim3 grid_combine(params.batch, params.heads);
+        smem_size = kHeadDim * params.num_splits * sizeof(float) + params.num_splits * sizeof(float); // O + softmax accumulators
+        flash_attention_fwd_split_kv_combine_kernel<KernelTraits><<<grid_combine, KernelTraits::kNThreads, smem_size, stream>>>(params);
+    }
+}
+
 
 void run_flash_attention_forward(ForwardParams& params, cudaStream_t stream) {
     FP16_SWITCH(!params.is_bf16, [&] {
         HEAD_DIM_SWITCH(params.head_dim, [&] {
             run_mha_fwd<ForwardKernelTraits<elem_type, kHeadDim, 64, 64, 4>>(params, stream);
+        });
+    });
+}
+
+// Decoding dispatch: specialize BlockM for single-token queries to reduce wasted threads
+void run_flash_attention_with_kv_cache(ForwardParams& params, cudaStream_t stream) {
+    FP16_SWITCH(!params.is_bf16, [&] {
+        HEAD_DIM_SWITCH(params.head_dim, [&] {
+            if (params.num_splits > 1) {
+                run_mha_decode<ForwardKernelTraits<elem_type, kHeadDim, 64, 64, 4>, /*Split=*/true>(params, stream);
+            } else {
+                run_mha_decode<ForwardKernelTraits<elem_type, kHeadDim, 64, 64, 4>, /*Split=*/false>(params, stream);
+            }
         });
     });
 }

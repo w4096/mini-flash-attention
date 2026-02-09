@@ -15,7 +15,6 @@ at::Tensor flash_attention_forward(
     int window_size_right);
 
 
-
 at::Tensor flash_attention_varlen_forward(
     const torch::Tensor& q,
     const torch::Tensor& k,
@@ -28,6 +27,15 @@ at::Tensor flash_attention_varlen_forward(
     int window_size_left,
     int window_size_right);
 
+
+at::Tensor mha_fwd_kvcache(
+    const torch::Tensor& q,
+    const torch::Tensor& k_cache,
+    const torch::Tensor& v_cache,
+    const std::optional<torch::Tensor>& seqlens_k_,
+    const std::optional<torch::Tensor>& block_table_,
+    bool causal,
+    int num_splits);
 
 // clang-format on
 

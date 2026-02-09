@@ -8,6 +8,7 @@ using namespace cute;
 
 namespace mfa {
 
+namespace prefill {
 
 template<typename KernelTraits>
 class Context {
@@ -651,9 +652,12 @@ struct Output {
     SmemTensor smem_;
 };
 
+}
+
 template<typename KernelTraits>
-__global__ void flash_attention_fwd_kernel(__grid_constant__ const ForwardParams params) {
+__global__ __launch_bounds__(128, 4) void flash_attention_fwd_kernel(__grid_constant__ const ForwardParams params) {
     using Element = KernelTraits::Element;
+    using namespace prefill;
 
     constexpr int kBlockN = KernelTraits::kBlockN;
     constexpr int kBlockM = KernelTraits::kBlockM;
