@@ -114,6 +114,8 @@ def flash_attn_with_kvcache(
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
         num_splits: int. Number of splits for large sequence lengths to reduce memory usage.
     """
+    assert q.size(1) == 1, "flash_attn_with_kvcache currently only supports seqlen_q=1 for decoding"
+    
     return _C.mini_flash_attention_with_kvcache(
         q, k_cache, v_cache,
         cache_seqlens,

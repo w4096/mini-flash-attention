@@ -109,7 +109,7 @@ The code uses NVIDIA CuTe library for clean tensor operations.
 
 - [x] Implement causal masking
 - [x] Support variable sequence lengths
-- [ ] Support KV cache
+- [x] Support KV cache
 
 ## References
 

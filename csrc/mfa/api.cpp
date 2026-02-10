@@ -155,13 +155,18 @@ std::tuple<at::Tensor, at::Tensor> forward_params_set_split_kv(
     if (num_splits < 1) {
         params.num_splits = num_splits_heuristic(batch * heads, num_n_blocks, 128);
     }
+    
+    // Ensure num_splits doesn't exceed the number of blocks
+    if (params.num_splits > num_n_blocks) {
+        params.num_splits = num_n_blocks;
+    }
 
     at::Tensor softmax_lse_accum;
     at::Tensor out_accum;
 
     if (params.num_splits > 1) {
-        softmax_lse_accum = torch::empty({params.num_splits, batch, heads}, opts.dtype(at::kFloat));
-        out_accum = torch::empty({params.num_splits, batch, heads, head_dim}, opts.dtype(at::kFloat));
+        softmax_lse_accum = torch::full({params.num_splits, batch, heads}, -std::numeric_limits<float>::infinity(), opts.dtype(at::kFloat));
+        out_accum = torch::zeros({params.num_splits, batch, heads, head_dim}, opts.dtype(at::kFloat));
         params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
         params.oaccum_ptr = out_accum.data_ptr();
     }
@@ -249,7 +254,6 @@ at::Tensor flash_attention_forward(
 
     auto stream = torch::cuda::getCurrentCUDAStream();
     run_flash_attention_forward(params, stream);
-    torch::cuda::stream_synchronize(stream);
 
     return out;
 }
@@ -288,7 +292,6 @@ at::Tensor flash_attention_varlen_forward(
     const int num_heads = sizes[1];
     const int head_dim = sizes[2];
     const int kv_num_heads = k.size(1);
-    std::cout << "batch: " << batch << ", num_heads: " << num_heads << ", head_dim: " << head_dim << ", kv_num_heads: " << kv_num_heads << std::endl;
     TORCH_CHECK(num_heads % kv_num_heads == 0, "number of key/value heads must be divisible by number of query heads");
 
     if (is_causal) { window_size_right = 0; }
@@ -303,7 +306,6 @@ at::Tensor flash_attention_varlen_forward(
 
     auto stream = torch::cuda::getCurrentCUDAStream();
     run_flash_attention_forward(params, stream);
-    torch::cuda::stream_synchronize(stream);
 
     return out;
 }
@@ -356,18 +358,18 @@ at::Tensor mha_fwd_kvcache(
     const int page_block_size = !paged_kv ? 1 : k_cache.size(1);
     const int seqlen_k = paged_kv ? max_num_blocks_per_seq * page_block_size : k_cache.size(1);
     const int kv_num_heads = k_cache.size(2);
-
-    TORCH_CHECK(k_cache.size(0) == batch, "batch size of q and k must be the same");
-    TORCH_CHECK(v_cache.size(0) == batch, "batch size of q and v must be the same");
-    TORCH_CHECK(k_cache.size(1) == seqlen_k, "sequence length of k must be the same as v");
-    TORCH_CHECK(v_cache.size(1) == seqlen_k, "sequence length of k must be the same as v");
     TORCH_CHECK(head_dim <= 256, "head dimension must be less than or equal to 256");
     TORCH_CHECK(num_heads % kv_num_heads == 0, "number of key/value heads must be divisible by number of query heads");
 
 
     CHECK_SHAPE(q, batch, seqlen_q, num_heads, head_dim);
-    CHECK_SHAPE(k_cache, batch, seqlen_k, kv_num_heads, head_dim);
-    CHECK_SHAPE(v_cache, batch, seqlen_k, kv_num_heads, head_dim);
+    if (paged_kv) {
+        CHECK_SHAPE(k_cache, num_blocks, page_block_size, kv_num_heads, head_dim);
+        CHECK_SHAPE(v_cache, num_blocks, page_block_size, kv_num_heads, head_dim);
+    } else {
+        CHECK_SHAPE(k_cache, batch, seqlen_k, kv_num_heads, head_dim);
+        CHECK_SHAPE(v_cache, batch, seqlen_k, kv_num_heads, head_dim);
+    }
 
     torch::Tensor out = torch::empty_like(q);
     
@@ -383,8 +385,10 @@ at::Tensor mha_fwd_kvcache(
         auto block_table = block_table_.value();
         CHECK_DEVICE(block_table);
         TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must be int32");
+        TORCH_CHECK(block_table.size(0) == batch, "block_table must have the same batch size as q");
         params.block_table = block_table.data_ptr<int>();
         params.block_table_batch_stride = block_table.stride(0);
+        params.page_block_size = page_block_size;
     }
 
     if (seqlens_k_.has_value()) {
@@ -404,7 +408,6 @@ at::Tensor mha_fwd_kvcache(
 
     auto stream = torch::cuda::getCurrentCUDAStream();
     run_flash_attention_with_kv_cache(params, stream);
-    torch::cuda::stream_synchronize(stream);
 
     return out;
 }

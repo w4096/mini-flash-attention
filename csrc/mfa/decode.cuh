@@ -13,6 +13,8 @@ namespace decode {
 template<typename KernelTraits>
 class Context {
  public:
+    using Element = typename KernelTraits::Element;
+
     __device__ Context(const ForwardParams& params) {
         constexpr int kBlockN = KernelTraits::kBlockN;
 
@@ -22,13 +24,13 @@ class Context {
             batch_idx_ = blockIdx.z;
             
             actual_seqlen_k = params.seqlens_k[batch_idx_];
-            const int n_blocks_per_split = cute::ceil_div(cute::ceil_div(params.seqlen_k, kBlockN), params.num_splits);
+            const int n_blocks_per_split = cute::ceil_div(cute::ceil_div(actual_seqlen_k, kBlockN), params.num_splits);
 
             n_block_min = split_idx_ * n_blocks_per_split;
             n_block_max = std::min(cute::ceil_div(actual_seqlen_k, kBlockN), (split_idx_ + 1) * n_blocks_per_split);
         } else {
-            batch_idx_ = blockIdx.y;
             head_idx_ = blockIdx.x;
+            batch_idx_ = blockIdx.y;
             actual_seqlen_k = params.seqlens_k[batch_idx_];
 
             n_block_min = 0;
@@ -36,36 +38,42 @@ class Context {
         }
     }
 
-    __device__ size_t get_q_gmem_offset(const ForwardParams& params) const {
+    __device__ Element* get_q_gmem_ptr(const ForwardParams& params) const {
         // For decode, Q is [batch, 1, heads, dim], always process the single query token
-        return batch_idx_ * params.q_batch_stride + head_idx_ * params.q_head_stride;
+        const size_t offset = batch_idx_ * params.q_batch_stride + head_idx_ * params.q_head_stride;
+        return static_cast<Element*>(params.q_ptr) + offset;
     }
 
-    __device__ size_t get_k_gmem_offset(const ForwardParams& params, int block_n_idx) const {
+    __device__ Element* get_k_gmem_ptr(const ForwardParams& params, int nbidx) const {
         const int kv_head_idx = head_idx_ / params.kv_group_size;
+        size_t offset;
         if (params.block_table) {
-            // Paged attention: use block table to find KV cache blocks
             const int* block_table_ptr = static_cast<const int*>(params.block_table) + batch_idx_ * params.block_table_batch_stride;
-            const int physical_block_idx = block_table_ptr[block_n_idx];
-            // K cache layout: [num_blocks, block_size, num_kv_heads, head_dim]
-            return physical_block_idx * params.k_batch_stride + kv_head_idx * params.k_head_stride;
+            const int block_table_idx = nbidx * KernelTraits::kBlockN / params.page_block_size;
+            const int block_table_offset = nbidx * KernelTraits::kBlockN - block_table_idx * params.page_block_size;
+            offset = block_table_ptr[block_table_idx] * params.k_batch_stride + block_table_offset * params.k_row_stride
+                + kv_head_idx * params.k_head_stride;
         } else {
-            // Direct KV cache access
-            return batch_idx_ * params.k_batch_stride + kv_head_idx * params.k_head_stride
-                   + block_n_idx * KernelTraits::kBlockN * params.k_row_stride;
+            offset = batch_idx_ * params.k_batch_stride + kv_head_idx * params.k_head_stride
+                   + nbidx * KernelTraits::kBlockN * params.k_row_stride;
         }
+        return static_cast<Element*>(params.k_ptr) + offset;
     }
 
-    __device__ size_t get_v_gmem_offset(const ForwardParams& params, int block_n_idx) const {
+    __device__ Element* get_v_gmem_ptr(const ForwardParams& params, int nbidx) const {
         const int kv_head_idx = head_idx_ / params.kv_group_size;
+        size_t offset;
         if (params.block_table) {
             const int* block_table_ptr = static_cast<const int*>(params.block_table) + batch_idx_ * params.block_table_batch_stride;
-            const int physical_block_idx = block_table_ptr[block_n_idx];
-            return physical_block_idx * params.v_batch_stride + kv_head_idx * params.v_head_stride;
+            const int block_table_idx = nbidx * KernelTraits::kBlockN / params.page_block_size;
+            const int block_table_offset = nbidx * KernelTraits::kBlockN - block_table_idx * params.page_block_size;
+            offset = block_table_ptr[block_table_idx] * params.v_batch_stride + block_table_offset * params.v_row_stride
+                + kv_head_idx * params.v_head_stride;
         } else {
-            return batch_idx_ * params.v_batch_stride + kv_head_idx * params.v_head_stride
-                   + block_n_idx * KernelTraits::kBlockN * params.v_row_stride;
+            offset = batch_idx_ * params.v_batch_stride + kv_head_idx * params.v_head_stride
+                   + nbidx * KernelTraits::kBlockN * params.v_row_stride;
         }
+        return static_cast<Element*>(params.v_ptr) + offset;
     }
 
     __device__ void* get_o_gmem_ptr(const ForwardParams& params) const {
@@ -104,8 +112,7 @@ class Query {
     using GmemTensor = decltype(make_tensor(make_gmem_ptr<Element>(nullptr), GmemLayout{}));
 
     explicit __device__ Query(const Context<KernelTraits>& ctx, const ForwardParams& params, Element* smem) {
-        const size_t offset = ctx.get_q_gmem_offset(params);
-        auto gmem_ptr = static_cast<Element*>(params.q_ptr) + offset;
+        auto gmem_ptr = ctx.get_q_gmem_ptr(params);
         gmem_ = make_tensor(make_gmem_ptr<Element>(gmem_ptr), GmemLayout{});
 
         smem_ = make_tensor(make_smem_ptr(smem), SmemLayout{});
@@ -154,8 +161,7 @@ class Key {
     using GmemTensor = decltype(make_tensor(make_gmem_ptr<Element>(nullptr), make_layout(GmemShape{}, GmemStride{})));
 
     explicit __device__ Key(const Context<KernelTraits>& ctx, const ForwardParams& params, Element* smem) {
-        const size_t offset = ctx.get_k_gmem_offset(params, 0);
-        auto gmem_ptr = static_cast<Element*>(params.k_ptr) + offset;
+        auto gmem_ptr = ctx.get_k_gmem_ptr(params, 0);
         const auto layout = make_layout(GmemShape{}, make_stride(params.k_row_stride, _1{}));
         gmem_ = make_tensor(make_gmem_ptr<Element>(gmem_ptr), layout);
 
@@ -197,8 +203,7 @@ class Key {
 
  private:
     __forceinline__ __device__ void set_gmem_address(const Context<KernelTraits>& ctx, const ForwardParams& params, int nbidx) {
-        const size_t offset = ctx.get_k_gmem_offset(params, nbidx);
-        auto gmem_ptr = static_cast<Element*>(params.k_ptr) + offset;
+        auto gmem_ptr = ctx.get_k_gmem_ptr(params, nbidx);
         gmem_ = make_tensor(make_gmem_ptr<Element>(gmem_ptr), gmem_.layout());
     }
 
@@ -218,8 +223,7 @@ struct Value {
     using GmemTensor = Key<KernelTraits>::GmemTensor;
 
     __device__ explicit Value(const Context<KernelTraits>& ctx, const ForwardParams& params, Element* smem) {
-        const index_t offset = ctx.get_v_gmem_offset(params, 0);
-        auto gmem_ptr = static_cast<Element*>(params.v_ptr) + offset;
+        auto gmem_ptr = ctx.get_v_gmem_ptr(params, 0);
         const auto layout = make_layout(GmemShape{}, make_stride(params.v_row_stride, _1{}));
         gmem_ = make_tensor(make_gmem_ptr<Element>(gmem_ptr), layout);
 
@@ -261,8 +265,7 @@ struct Value {
  private:
 
     __forceinline__ __device__ void set_gmem_address(const Context<KernelTraits>& ctx, const ForwardParams& params, int nbidx) {
-        const size_t offset = ctx.get_v_gmem_offset(params, nbidx);
-        auto gmem_ptr = static_cast<Element*>(params.v_ptr) + offset;
+        auto gmem_ptr = ctx.get_v_gmem_ptr(params, nbidx);
         gmem_ = make_tensor(make_gmem_ptr<Element>(gmem_ptr), gmem_.layout());
     }
 
@@ -366,7 +369,6 @@ class Softmax {
         for (int n = 0; n < size<0>(score.score()); n++) {
             new_max = max(new_max, score(n));
         }
-
         rescale_ = exp2f((max_ - new_max) * softmax_scale_log2);
         max_ = max(max_, new_max);
 
@@ -447,6 +449,10 @@ struct Output {
         }
     }
 
+    __device__ void zero() {
+        cute::fill(rmem_, .0f);
+    }
+
     template<typename Tensor0>
     __device__ void copy_smem_to_gmem(const Context<KernelTraits>& ctx, const ForwardParams& params, const Tensor0& smem) {
         using Element = typename KernelTraits::Element;
@@ -482,7 +488,9 @@ struct Output {
         // sum up all rows
         for (int i = 0; i < size<1>(warp_out); i += BlockSize) {
             int col = i + threadIdx.x;
-            if (col >= size<1>(warp_out)) break;
+            if (col >= size<1>(warp_out)) {
+                break;
+            }
             float sum = 0;
             for (int row = 0; row < size<0>(warp_out); row++) {
                 sum += warp_out(row, col);
@@ -521,6 +529,11 @@ __global__ void flash_attention_fwd_split_kv_kernel(__grid_constant__ const Forw
     constexpr int kHeadDim = KernelTraits::kHeadDim;
     
     Context<KernelTraits> ctx(params);
+
+    if (ctx.n_block_min >= ctx.n_block_max) {
+        // no valid K/V blocks for this split, just return
+        return;
+    }
 
     // init shared memory block tensors
     extern __shared__ char smem_data[];
@@ -575,28 +588,40 @@ __global__ void flash_attention_fwd_split_kv_kernel(__grid_constant__ const Forw
     float *warp_max_val = reinterpret_cast<float*>(score_smem); // reuse score_smem for storing per-warp max values
     float *warp_expsum_val = warp_max_val + KernelTraits::kNWarps;
 
-    if (threadIdx.x % 32 == 0) {
+    const int warp_idx = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    if (lane == 0) {
         // Each warp writes its local max and exp sum to shared memory
-        warp_max_val[threadIdx.x / 32] = softmax.rowmax();
-        warp_expsum_val[threadIdx.x / 32] = softmax.expsum();
+        warp_max_val[warp_idx] = softmax.rowmax();
+        warp_expsum_val[warp_idx] = softmax.expsum();
     }
     __syncthreads();
 
     // get global max and exp sum across warps
+    // Only include warps that have valid data (i.e., their max is not -INFINITY)
     float gloabl_max_val = -INFINITY;
     for (int i = 0; i < KernelTraits::kNWarps; i++) {
         gloabl_max_val = max(gloabl_max_val, warp_max_val[i]);
     }
+    
     float gloabl_expsum_val = 0.f;
     for (int i = 0; i < KernelTraits::kNWarps; i++) {
-        // Need to rescale each warp's exp sum by the difference between its local max and the global max
-        const float rescale = exp2f((warp_max_val[i] - gloabl_max_val) * params.softmax_scale_log2);
-        gloabl_expsum_val += warp_expsum_val[i] * rescale;
+        // Only include this warp if it has valid data (max is not -INFINITY)
+        if (warp_max_val[i] != -INFINITY) {
+            // Need to rescale each warp's exp sum by the difference between its local max and the global max
+            const float rescale = exp2f((warp_max_val[i] - gloabl_max_val) * params.softmax_scale_log2);
+            gloabl_expsum_val +=  warp_expsum_val[i] * rescale;
+        }
     }
 
-    // Now we have the global max and exp sum, we can normalize the output.
-    const float rescale = exp2f((softmax.rowmax() - gloabl_max_val) * params.softmax_scale_log2);
-    O.normalize(gloabl_expsum_val, rescale);
+    // Only normalize if this warp has valid data
+    if (softmax.rowmax() != -INFINITY) {
+        // Now we have the global max and exp sum, we can normalize the output.
+        const float rescale = exp2f((softmax.rowmax() - gloabl_max_val) * params.softmax_scale_log2);
+        O.normalize(gloabl_expsum_val, rescale);
+    } else {
+        O.zero();
+    }
 
     // Copy the normalized output from register to shared memory for reduction
     using WarpOutLayout = Layout<Shape<Int<KernelTraits::kNWarps>, Int<kHeadDim>>, Stride<Int<kHeadDim>, _1>>;
@@ -642,18 +667,14 @@ __global__ void flash_attention_fwd_split_kv_combine_kernel(__grid_constant__ co
     using Element = KernelTraits::Element;
     using namespace decode;
     constexpr int kHeadDim = KernelTraits::kHeadDim;
+    constexpr int kBlockN = KernelTraits::kBlockN;
 
-    const int total_blocks = params.batch * params.heads;
     const int batch_idx = blockIdx.x;
     const int head_idx = blockIdx.y;
-    const int linear_idx = head_idx * gridDim.x + batch_idx;
-
-
-    if (linear_idx >= total_blocks) return;
-    
 
     extern __shared__ float smem_[]; // one max per block (head)
-    const int num_splits = params.num_splits;
+    int num_splits = params.num_splits;
+
     
     // Pointers to accumulated outputs and LSE values from each split
     float* lse_accum = static_cast<float*>(params.softmax_lseaccum_ptr);
@@ -698,7 +719,10 @@ __global__ void flash_attention_fwd_split_kv_combine_kernel(__grid_constant__ co
     float global_lse = 0;
     for (int split = 0; split < num_splits; split++) {
         float split_lse = lse_smem_tensor(split);
-        global_lse += expf(split_lse);
+        // Only include splits that actually processed data (LSE != -INFINITY)
+        if (split_lse != -INFINITY) {
+            global_lse += expf(split_lse);
+        }
     }
     global_lse = __logf(global_lse);
 
@@ -714,7 +738,10 @@ __global__ void flash_attention_fwd_split_kv_combine_kernel(__grid_constant__ co
             for (int split = 0; split < num_splits; split++) {
                 const int row = split;
                 float split_lse = lse_smem_tensor(split);
-                o_accum_sum += o_accum_smem_tensor(row, col) * expf(split_lse - global_lse);
+                // Only include splits that actually processed data (LSE != -INFINITY)
+                if (split_lse != -INFINITY) {
+                    o_accum_sum += o_accum_smem_tensor(row, col) * expf(split_lse - global_lse);
+                }
             }
             output_tensor(batch_idx, head_idx, col) = static_cast<Element>(o_accum_sum);
         }

@@ -56,6 +56,7 @@ struct ForwardParams {
 
     void * __restrict__ block_table; // optional block table for flash attention with KV caching
     int block_table_batch_stride;
+    int page_block_size;
 
 
     int* __restrict__ seqlens_k;
