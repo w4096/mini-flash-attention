@@ -27,8 +27,8 @@ class Context {
             n_block_min = split_idx_ * n_blocks_per_split;
             n_block_max = std::min(cute::ceil_div(actual_seqlen_k, kBlockN), (split_idx_ + 1) * n_blocks_per_split);
         } else {
-            batch_idx_ = blockIdx.z;
-            head_idx_ = blockIdx.y;
+            batch_idx_ = blockIdx.y;
+            head_idx_ = blockIdx.x;
             actual_seqlen_k = params.seqlens_k[batch_idx_];
 
             n_block_min = 0;
@@ -286,7 +286,6 @@ class Score {
 
     __device__ Score(const Query<KernelTraits>& query, const Key<KernelTraits>& key) {
         score_ = cute::make_tensor<ElementAccum>(ScoreTensorLayout{});
-        cute::fill(score_, ElementAccum{0});
 
         const int lane = threadIdx.x % 32;
         const int warp_idx = threadIdx.x / 32;
@@ -351,7 +350,7 @@ class Softmax {
     }
 
     __device__ void update(Score<KernelTraits>& score, float softmax_scale_log2) {
-        ElementAccum new_max = -INFINITY;
+        ElementAccum new_max = max_;
         for (int n = 0; n < size<0>(score.score()); n++) {
             new_max = max(new_max, score(n));
         }
@@ -438,29 +437,34 @@ struct Output {
 
     template<typename Tensor0>
     __device__ void copy_smem_to_gmem(const Context<KernelTraits>& ctx, const ForwardParams& params, const Tensor0& smem) {
-        using DataType = typename Tensor0::value_type;
-        static_assert(std::is_same_v<DataType, std::conditional_t<Split, float, typename KernelTraits::Element>>, "DataType must match expected output type based on Split");
+        using Element = typename KernelTraits::Element;
+        static_assert(std::is_same_v<typename Tensor0::value_type, float>, "smem tensor must be of type float");
 
         void* gmem_ptr = ctx.get_o_gmem_ptr(params);
         using GmemShape = Shape<Int<KernelTraits::kHeadDim>>;
         auto layout = make_layout(GmemShape{}, make_stride(_1{}));
-        auto gmem = make_tensor(make_gmem_ptr<DataType>(gmem_ptr), layout);
+
+        using GmemType = std::conditional_t<Split, float, Element>;
+        auto gmem = make_tensor(make_gmem_ptr<GmemType>(gmem_ptr), layout);
 
         for (unsigned int i = 0; i < size(smem); i += KernelTraits::kBlockSize * 2) {
             auto idx = i + threadIdx.x * 2;
-            if (idx >= size(smem)) break; // boundary check
+            if (idx >= size(smem)) {
+                break;
+            }
 
-            if constexpr (std::is_same_v<DataType, float>) {
+            if constexpr (Split) {
                 *reinterpret_cast<float2*>(&gmem(idx)) = *reinterpret_cast<const float2*>(&smem(idx));
-            } else {
-                *reinterpret_cast<uint32_t*>(&gmem(idx)) = *reinterpret_cast<const uint32_t*>(&smem(idx));
+            } else if constexpr (std::is_same_v<Element, half_t>) {
+                *reinterpret_cast<half2*>(&gmem(idx)) = __float22half2_rn(*reinterpret_cast<const float2*>(&smem(idx)));
+            } else if constexpr (std::is_same_v<Element, bfloat16_t>) {
+                *reinterpret_cast<nv_bfloat162*>(&gmem(idx)) = __float22bfloat162_rn(*reinterpret_cast<const float2*>(&smem(idx)));
             }
         }
     }
 
     template<typename Tensor0, typename Tensor1>
     __forceinline__ __device__ void reduce_sum_warp_out(const Tensor0& warp_out, Tensor1& out) {
-        using OutType = typename Tensor1::value_type;
         constexpr int BlockSize = KernelTraits::kBlockSize;
 
         // sum up all rows
@@ -471,7 +475,7 @@ struct Output {
             for (int row = 0; row < size<0>(warp_out); row++) {
                 sum += warp_out(row, col);
             }
-            out(col) = static_cast<OutType>(sum);
+            out(col) = sum;
         }
     }
 
@@ -508,14 +512,14 @@ __global__ void flash_attention_fwd_split_kv_kernel(__grid_constant__ const Forw
 
     // init shared memory block tensors
     extern __shared__ char smem_data[];
-    Element* smem_ptr = reinterpret_cast<Element*>(smem_data);
-    Query<KernelTraits> Q(ctx, params, smem_ptr);
+
+    Query<KernelTraits> Q(ctx, params, reinterpret_cast<Element*>(smem_data));
 
     uint32_t offset = size(typename Query<KernelTraits>::SmemLayout{});
-    Key<KernelTraits> K(ctx, params, smem_ptr + offset);
+    Key<KernelTraits> K(ctx, params, reinterpret_cast<Element*>(smem_data) + offset);
     
     offset += size(typename Key<KernelTraits>::SmemLayout{});
-    Value<KernelTraits> V(ctx, params, smem_ptr + offset);
+    Value<KernelTraits> V(ctx, params, reinterpret_cast<Element*>(smem_data) + offset);
 
     Output<KernelTraits, Split> O(ctx, params);
 
@@ -580,7 +584,7 @@ __global__ void flash_attention_fwd_split_kv_kernel(__grid_constant__ const Forw
 
     // Copy the normalized output from register to shared memory for reduction
     using WarpOutLayout = Layout<Shape<Int<KernelTraits::kNWarps>, Int<kHeadDim>>, Stride<Int<kHeadDim>, _1>>;
-    Tensor warp_output = make_tensor(make_smem_ptr<float>(smem_ptr), WarpOutLayout{});
+    Tensor warp_output = make_tensor(make_smem_ptr<float>(smem_data), WarpOutLayout{});
     O.copy_rmem_to_smem(warp_output);
 
     __syncthreads();
@@ -588,8 +592,9 @@ __global__ void flash_attention_fwd_split_kv_kernel(__grid_constant__ const Forw
 
     // Perform a rueduce sum across warps to get the final output for this block
     using ReduceSumLayout = Layout<Shape<Int<kHeadDim>>, Stride<_1>>;
-    using OutputType = std::conditional_t<Split, float, typename KernelTraits::Element>;
-    Tensor reduce_sum_output = make_tensor(make_smem_ptr<OutputType>(smem_ptr), ReduceSumLayout{});
+    Tensor reduce_sum_output = make_tensor(
+        make_smem_ptr<float>(smem_data + size(WarpOutLayout{}) * sizeof(float)),
+        ReduceSumLayout{});
     O.reduce_sum_warp_out(warp_output, reduce_sum_output);
 
     __syncthreads();
@@ -599,15 +604,21 @@ __global__ void flash_attention_fwd_split_kv_kernel(__grid_constant__ const Forw
     O.copy_smem_to_gmem(ctx, params, reduce_sum_output);
 
     // write the LSE value to global memory for this split, batch, head
-    if (threadIdx.x == 0 && params.num_splits > 1) {
+    if (threadIdx.x == 0) {
         float lse = gloabl_max_val * params.softmax_scale + __logf(gloabl_expsum_val);
-
-        auto layout = make_layout(make_shape(params.num_splits, params.batch, params.heads), make_stride(params.batch * params.heads, params.heads, _1{}));
-        auto lse_tensor = make_tensor(make_gmem_ptr<float>(params.softmax_lseaccum_ptr), layout);
-        lse_tensor(ctx.split_idx_, ctx.batch_idx_, ctx.head_idx_) = lse;
+        if constexpr (Split) {
+            auto layout = make_layout(make_shape(params.num_splits, params.batch, params.heads), make_stride(params.batch * params.heads, params.heads, _1{}));
+            auto lse_tensor = make_tensor(make_gmem_ptr<float>(params.softmax_lseaccum_ptr), layout);
+            lse_tensor(ctx.split_idx_, ctx.batch_idx_, ctx.head_idx_) = lse;
+        } else {
+            if (params.softmax_lse_ptr) {
+                auto layout = make_layout(make_shape(params.batch, params.heads), make_stride(params.heads, _1{}));
+                auto lse_tensor = make_tensor(make_gmem_ptr<float>(params.softmax_lse_ptr), layout);
+                lse_tensor(ctx.batch_idx_, ctx.head_idx_) = lse;
+            }
+        }
     }
 }
-
 
 
 template<typename KernelTraits>
@@ -647,7 +658,6 @@ __global__ void flash_attention_fwd_split_kv_combine_kernel(__grid_constant__ co
     auto lse_smem_tensor = make_tensor(make_smem_ptr<float>(smem_ + KernelTraits::kHeadDim * num_splits), lse_smem_layout);
 
     // copy accumulated outputs from global memory to shared memory for reduction
-    // TODO: async copy
     for (int i = 0; i < num_splits * kHeadDim; i += KernelTraits::kBlockSize * 4) {
         auto idx = i + threadIdx.x * 4;
         const auto row = idx / kHeadDim;
@@ -692,6 +702,13 @@ __global__ void flash_attention_fwd_split_kv_combine_kernel(__grid_constant__ co
             }
             output_tensor(batch_idx, head_idx, col) = static_cast<Element>(o_accum_sum);
         }
+    }
+
+    // save global LSE to global memory for potential use in backward pass
+    if (threadIdx.x == 0 && params.softmax_lse_ptr) {
+        auto lse_output_layout = make_layout(make_shape(params.batch, params.heads), make_stride(params.heads, _1{}));
+        auto lse_output_tensor = make_tensor(make_gmem_ptr<float>(params.softmax_lse_ptr), lse_output_layout);
+        lse_output_tensor(batch_idx, head_idx) = global_lse;
     }
 }
 

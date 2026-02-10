@@ -1,5 +1,5 @@
-#include "api.h"
-#include "flash.h"
+#include "mfa/api.h"
+#include "mfa/flash.h"
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/types.h>
 #include <vector>
@@ -8,6 +8,22 @@
 #define CHECK_SHAPE(x, ...)                                                                                            \
     TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
+
+#if !defined(__CUDACC_RTC__)
+#include "cuda_runtime.h"
+#endif
+
+#define CHECK_CUDA(call)                                                       \
+  do {                                                                         \
+    cudaError_t status_ = call;                                                \
+    if (status_ != cudaSuccess) {                                              \
+      fprintf(stderr, "CUDA error (%s:%d): %s\n", __FILE__, __LINE__,          \
+              cudaGetErrorString(status_));                                    \
+      exit(1);                                                                 \
+    }                                                                          \
+  } while (0)
+
+
 
 namespace mfa {
 
@@ -84,6 +100,43 @@ void forward_params_init(ForwardParams& params,
     params.softmax_scale_log2 = params.softmax_scale * M_LOG2E;
 }
 
+
+static int num_splits_heuristic(int batch_nheads, int num_n_blocks, int max_splits) {
+    int device;
+    CHECK_CUDA(cudaGetDevice(&device));
+    int num_SMs;
+    CHECK_CUDA(cudaDeviceGetAttribute(&num_SMs, cudaDevAttrMultiProcessorCount, device));
+    num_SMs *= 2;
+
+    if (batch_nheads * 100 > num_SMs * 80) {
+        return 1;
+    }
+
+    auto ceildiv = [](int a, int b) { return (a + b - 1) / b; };
+    max_splits = std::min({max_splits, num_SMs, num_n_blocks});
+
+    float max_efficiency = 0.0f;
+    int max_efficiency_splits = 1;
+    for (int splits = 1; splits <= max_splits; splits ++) {
+        if (splits > 1 && ceildiv(num_n_blocks, splits) == ceildiv(num_n_blocks, splits - 1)) {
+            continue;
+        }
+
+        float n_waves = static_cast<float>(batch_nheads * splits) / num_SMs;
+        float efficiency = n_waves / std::ceil(n_waves);
+        if (efficiency > 0.9) {
+            return splits;
+        }
+        if (efficiency > max_efficiency) {
+            max_efficiency = efficiency;
+            max_efficiency_splits = splits;
+        }
+    }
+
+    return max_efficiency_splits;
+}
+
+
 std::tuple<at::Tensor, at::Tensor> forward_params_set_split_kv(
     ForwardParams& params,
     const int batch,
@@ -94,23 +147,17 @@ std::tuple<at::Tensor, at::Tensor> forward_params_set_split_kv(
     const int num_splits,
     const at::TensorOptions& opts
 ) {
-    const int block_n = head_dim <= 64 ? 256 : (head_dim <= 128 ? 128 : 64);
+    const int block_n = 64;
     const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
-    const int num_m_blocks = (max_seqlen_q + 63) / 64;
 
-    params.num_splits = 2;
+    params.num_splits = num_splits;
+
+    if (num_splits < 1) {
+        params.num_splits = num_splits_heuristic(batch * heads, num_n_blocks, 128);
+    }
+
     at::Tensor softmax_lse_accum;
     at::Tensor out_accum;
-    int max_splits = 128;
-
-
-    int num_sm = 0;
-    cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, 0);
-    max_splits = std::min({max_splits, num_sm, num_n_blocks});
-
-    // set num_splits according to the number of blocks
-    int blocks = batch * heads * num_n_blocks;
-
 
     if (params.num_splits > 1) {
         softmax_lse_accum = torch::empty({params.num_splits, batch, heads}, opts.dtype(at::kFloat));
@@ -118,7 +165,6 @@ std::tuple<at::Tensor, at::Tensor> forward_params_set_split_kv(
         params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
         params.oaccum_ptr = out_accum.data_ptr();
     }
-
 
     return {softmax_lse_accum, out_accum};
 }
@@ -350,7 +396,8 @@ at::Tensor mha_fwd_kvcache(
     }
 
     auto opts = q.options();
-    auto softmax_lse = torch::empty({batch, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+    auto softmax_lse = torch::empty({batch, num_heads}, opts.dtype(at::kFloat));
+    params.softmax_lse_ptr = softmax_lse.data_ptr();
 
     at::Tensor softmax_lse_accum, out_accum;
     std::tie(softmax_lse_accum, out_accum) = forward_params_set_split_kv(params, batch, num_heads, head_dim, seqlen_k, seqlen_q, num_splits, opts);
