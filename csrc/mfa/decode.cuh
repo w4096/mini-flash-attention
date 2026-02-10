@@ -320,6 +320,18 @@ class Score {
         }
     }
 
+
+    __device__ void set_mask(const Context<KernelTraits>& ctx, const ForwardParams& params, int nbidx) {
+        const int block_start_row = nbidx * KernelTraits::kBlockN;
+
+        for (int n = 0; n < rows_per_warp; n++) {
+            int row = block_start_row + n * KernelTraits::kNWarps + threadIdx.x / 32;
+            if (row >= ctx.actual_seqlen_k) {
+                score_(n) = -INFINITY;
+            }
+        }
+    }
+
     __device__ const ScoreTensor& score() const {
         return score_;
     }
@@ -539,6 +551,10 @@ __global__ void flash_attention_fwd_split_kv_kernel(__grid_constant__ const Forw
         cute::cp_async_fence();
 
         Score<KernelTraits> score(Q, K);
+
+        if (ctx.actual_seqlen_k % KernelTraits::kBlockN != 0 && nbidx == ctx.n_block_max - 1) {
+            score.set_mask(ctx, params, nbidx);
+        }
 
         softmax.update(score, params.softmax_scale_log2);
 
