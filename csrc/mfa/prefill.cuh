@@ -3,6 +3,7 @@
 #include "mfa/flash.h"
 #include "mfa/utils.cuh"
 #include <cute/tensor.hpp>
+#include <cute/arch/copy_sm90.hpp>
 
 using namespace cute;
 
@@ -544,7 +545,7 @@ struct Output {
     template<typename Tensor0>
     __device__ void accum(const Softmax<KernelTraits>::RescaleTensor& rescale, Tensor0 const& score,
                           const Value<KernelTraits>& value) {
-        
+
         for (int n = 0; n < n_tiles; n++) {
             float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
 
@@ -630,6 +631,36 @@ struct Output {
     __forceinline__ __device__ void copy_rmem_to_smem() {
         int wrap_id = threadIdx.x / 32;
         int lane = threadIdx.x % 32;
+#if __CUDA_ARCH__ >= 900
+    // Use Hopper STSM when available; avoids cutlass guard failure on other archs.
+        for (int n = 0; n < n_tiles; n++) {
+            int row = wrap_id * MMA_m + lane;
+            int col = n * MMA_n + 0;
+
+            uint128_t *addr = reinterpret_cast<uint128_t*>(&smem(row, col));
+            
+            uint32_t a0, a1;
+            if constexpr (std::is_same_v<Element, half_t>) {
+                float2 *f2 = reinterpret_cast<float2*>(&rmem_(n, 0));
+                *reinterpret_cast<half2*>(&a0) = __float22half2_rn(*f2);
+
+                f2 = reinterpret_cast<float2*>(&rmem_(n, 2));
+                *reinterpret_cast<half2*>(&a1) = __float22half2_rn(*f2);
+            } else {
+                float2 *f2 = reinterpret_cast<float2*>(&rmem_(n, 0));
+                *reinterpret_cast<nv_bfloat162*>(&a0) = __float22bfloat162_rn(*f2);
+
+                f2 = reinterpret_cast<float2*>(&rmem_(n, 2));
+                *reinterpret_cast<nv_bfloat162*>(&a1) = __float22bfloat162_rn(*f2);
+            }
+            // SM90_U32x2_STSM_N::copy(a0, a1, *addr);
+
+            uint32_t smem_int_ptr = cast_smem_ptr_to_uint(addr);
+            asm volatile ("stmatrix.sync.aligned.x2.m8n8.shared.b16 [%0], {%1, %2};\n"
+                            :: "r"(smem_int_ptr),
+                            "r"(a0), "r"(a1));
+        }
+#else
 
         for (int n = 0; n < n_tiles; n++) {
             // the row and col within 16x8 tile of output matrix
@@ -655,6 +686,7 @@ struct Output {
                 *b2 = __float22bfloat162_rn(*f2);
             }
         }
+#endif
     }
 
     __forceinline__ __device__ const Element& smem(unsigned int row, unsigned int col) const {
