@@ -19,19 +19,19 @@ class Context {
         constexpr int kBlockN = KernelTraits::kBlockN;
 
         if (params.num_splits > 1) {
-            split_idx_ = blockIdx.x;
-            head_idx_ = blockIdx.y;
-            batch_idx_ = blockIdx.z;
+            split_idx = blockIdx.x;
+            head_idx = blockIdx.y;
+            batch_idx = blockIdx.z;
             
-            actual_seqlen_k = params.seqlens_k[batch_idx_];
+            actual_seqlen_k = params.seqlens_k[batch_idx];
             const int n_blocks_per_split = cute::ceil_div(cute::ceil_div(actual_seqlen_k, kBlockN), params.num_splits);
 
-            n_block_min = split_idx_ * n_blocks_per_split;
-            n_block_max = std::min(cute::ceil_div(actual_seqlen_k, kBlockN), (split_idx_ + 1) * n_blocks_per_split);
+            n_block_min = split_idx * n_blocks_per_split;
+            n_block_max = std::min(cute::ceil_div(actual_seqlen_k, kBlockN), (split_idx + 1) * n_blocks_per_split);
         } else {
-            head_idx_ = blockIdx.x;
-            batch_idx_ = blockIdx.y;
-            actual_seqlen_k = params.seqlens_k[batch_idx_];
+            head_idx = blockIdx.x;
+            batch_idx = blockIdx.y;
+            actual_seqlen_k = params.seqlens_k[batch_idx];
 
             n_block_min = 0;
             n_block_max = cute::ceil_div(actual_seqlen_k, kBlockN);
@@ -40,37 +40,37 @@ class Context {
 
     __device__ Element* get_q_gmem_ptr(const ForwardParams& params) const {
         // For decode, Q is [batch, 1, heads, dim], always process the single query token
-        const size_t offset = batch_idx_ * params.q_batch_stride + head_idx_ * params.q_head_stride;
+        const size_t offset = batch_idx * params.q_batch_stride + head_idx * params.q_head_stride;
         return static_cast<Element*>(params.q_ptr) + offset;
     }
 
     __device__ Element* get_k_gmem_ptr(const ForwardParams& params, int nbidx) const {
-        const int kv_head_idx = head_idx_ / params.kv_group_size;
+        const int kv_head_idx = head_idx / params.kv_group_size;
         size_t offset;
         if (params.block_table) {
-            const int* block_table_ptr = static_cast<const int*>(params.block_table) + batch_idx_ * params.block_table_batch_stride;
+            const int* block_table_ptr = static_cast<const int*>(params.block_table) + batch_idx * params.block_table_batch_stride;
             const int block_table_idx = nbidx * KernelTraits::kBlockN / params.page_block_size;
             const int block_table_offset = nbidx * KernelTraits::kBlockN - block_table_idx * params.page_block_size;
-            offset = block_table_ptr[block_table_idx] * params.k_batch_stride + block_table_offset * params.k_row_stride
+            offset = block_table_ptr[block_table_idx] * params.k_cache_block_stride + block_table_offset * params.k_row_stride
                 + kv_head_idx * params.k_head_stride;
         } else {
-            offset = batch_idx_ * params.k_batch_stride + kv_head_idx * params.k_head_stride
+            offset = batch_idx * params.k_batch_stride + kv_head_idx * params.k_head_stride
                    + nbidx * KernelTraits::kBlockN * params.k_row_stride;
         }
         return static_cast<Element*>(params.k_ptr) + offset;
     }
 
     __device__ Element* get_v_gmem_ptr(const ForwardParams& params, int nbidx) const {
-        const int kv_head_idx = head_idx_ / params.kv_group_size;
+        const int kv_head_idx = head_idx / params.kv_group_size;
         size_t offset;
         if (params.block_table) {
-            const int* block_table_ptr = static_cast<const int*>(params.block_table) + batch_idx_ * params.block_table_batch_stride;
+            const int* block_table_ptr = static_cast<const int*>(params.block_table) + batch_idx * params.block_table_batch_stride;
             const int block_table_idx = nbidx * KernelTraits::kBlockN / params.page_block_size;
             const int block_table_offset = nbidx * KernelTraits::kBlockN - block_table_idx * params.page_block_size;
-            offset = block_table_ptr[block_table_idx] * params.v_batch_stride + block_table_offset * params.v_row_stride
+            offset = block_table_ptr[block_table_idx] * params.v_cache_block_stride + block_table_offset * params.v_row_stride
                 + kv_head_idx * params.v_head_stride;
         } else {
-            offset = batch_idx_ * params.v_batch_stride + kv_head_idx * params.v_head_stride
+            offset = batch_idx * params.v_batch_stride + kv_head_idx * params.v_head_stride
                    + nbidx * KernelTraits::kBlockN * params.v_row_stride;
         }
         return static_cast<Element*>(params.v_ptr) + offset;
@@ -79,10 +79,10 @@ class Context {
     __device__ void* get_o_gmem_ptr(const ForwardParams& params) const {
         size_t offset;
         if (params.num_splits > 1) {
-            offset = ((split_idx_ * params.batch + batch_idx_) * params.heads + head_idx_) * params.head_dim;
+            offset = ((split_idx * params.batch + batch_idx) * params.heads + head_idx) * params.head_dim;
             return static_cast<void*>(static_cast<float*>(params.oaccum_ptr) + offset);
         } else {
-            offset = batch_idx_ * params.o_batch_stride + head_idx_ * params.o_head_stride;
+            offset = batch_idx * params.o_batch_stride + head_idx * params.o_head_stride;
             return static_cast<void*>(static_cast<half*>(params.o_ptr) + offset);
         }
     }
@@ -90,11 +90,11 @@ class Context {
     int actual_seqlen_q;
     int actual_seqlen_k;
 
-    int batch_idx_;
-    int head_idx_;
+    int batch_idx;
+    int head_idx;
     int n_block_min;
     int n_block_max;
-    int split_idx_;
+    int split_idx;
 };
 
 
@@ -650,12 +650,12 @@ __global__ void flash_attention_fwd_split_kv_kernel(__grid_constant__ const Forw
         if constexpr (Split) {
             auto layout = make_layout(make_shape(params.num_splits, params.batch, params.heads), make_stride(params.batch * params.heads, params.heads, _1{}));
             auto lse_tensor = make_tensor(make_gmem_ptr<float>(params.softmax_lseaccum_ptr), layout);
-            lse_tensor(ctx.split_idx_, ctx.batch_idx_, ctx.head_idx_) = lse;
+            lse_tensor(ctx.split_idx, ctx.batch_idx, ctx.head_idx) = lse;
         } else {
             if (params.softmax_lse_ptr) {
                 auto layout = make_layout(make_shape(params.batch, params.heads), make_stride(params.heads, _1{}));
                 auto lse_tensor = make_tensor(make_gmem_ptr<float>(params.softmax_lse_ptr), layout);
-                lse_tensor(ctx.batch_idx_, ctx.head_idx_) = lse;
+                lse_tensor(ctx.batch_idx, ctx.head_idx) = lse;
             }
         }
     }
@@ -667,7 +667,6 @@ __global__ void flash_attention_fwd_split_kv_combine_kernel(__grid_constant__ co
     using Element = KernelTraits::Element;
     using namespace decode;
     constexpr int kHeadDim = KernelTraits::kHeadDim;
-    constexpr int kBlockN = KernelTraits::kBlockN;
 
     const int batch_idx = blockIdx.x;
     const int head_idx = blockIdx.y;

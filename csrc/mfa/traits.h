@@ -8,7 +8,7 @@
 
 namespace mfa {
 
-template<typename Element_, int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_>
+template<typename Element_, int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, bool IsVarlen_ = false>
 struct ForwardKernelTraits {
     using Element = Element_;
     using ElementAccum = float;
@@ -20,6 +20,7 @@ struct ForwardKernelTraits {
         cute::SM80_16x8x16_F32BF16BF16F32_TN>;
 
     static constexpr bool CpAsyncSupported = true;
+    static constexpr bool is_varlen = IsVarlen_;
 
     static constexpr int kNWarps = kNWarps_;
     static constexpr int kNThreads = kNWarps * 32;

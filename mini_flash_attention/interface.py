@@ -49,6 +49,7 @@ def flash_attn_varlen_func(
     max_seqlen_k: int,
     causal: bool = False,
     window_size: Tuple[int, int] = (-1, -1),
+    block_table=None,
 ) -> torch.Tensor:
     """
     Mini Flash Attention forward pass for variable-length sequences (continuous batching).
@@ -71,6 +72,9 @@ def flash_attn_varlen_func(
         max_seqlen_k: int. Maximum key/value sequence length in the batch.
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
         window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        block_table: (batch_size, max_blocks_per_seq), dtype torch.int32. If provided,
+           uses the block table to find the correct blocks in k, v. This is used for variable-length sequences
+           with prefix caching, where the valid blocks in k, v may not be contiguous.
     
     Return:
         out: (total_q, nheads, headdim).
@@ -87,7 +91,8 @@ def flash_attn_varlen_func(
         >>> out = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, causal=True)
     """
     return _C.mini_flash_attention_varlen_forward(
-        q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal, window_size[0], window_size[1]
+        q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal,
+        window_size[0], window_size[1], block_table
     )
 
 

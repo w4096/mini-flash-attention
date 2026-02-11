@@ -9,7 +9,7 @@ namespace mfa {
 
 
 template<typename KernelTraits>
-void run_mha_fwd(const ForwardParams& params, cudaStream_t stream) {
+void run_mha_prefill(const ForwardParams& params, cudaStream_t stream) {
     dim3 grid, block;
     block = dim3(KernelTraits::kNThreads);
     
@@ -72,7 +72,9 @@ void run_mha_decode(const ForwardParams& params, cudaStream_t stream) {
 void run_flash_attention_forward(ForwardParams& params, cudaStream_t stream) {
     FP16_SWITCH(!params.is_bf16, [&] {
         HEAD_DIM_SWITCH(params.head_dim, [&] {
-            run_mha_fwd<ForwardKernelTraits<elem_type, kHeadDim, 64, 64, 4>>(params, stream);
+            BOOL_SWITCH(params.cu_seqlens_k != nullptr, IsVarlen, [&] {
+                run_mha_prefill<ForwardKernelTraits<elem_type, kHeadDim, 64, 64, 4, IsVarlen>>(params, stream);
+            });
         });
     });
 }

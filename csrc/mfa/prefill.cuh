@@ -13,8 +13,10 @@ namespace prefill {
 template<typename KernelTraits>
 class Context {
  public:
+    using Element = typename KernelTraits::Element;
+
     __device__ Context(const ForwardParams& params, const int batch_idx, const int head_idx, const int block_m_idx) {
-        if (params.cu_seqlens_q) {
+        if constexpr (KernelTraits::is_varlen) {
             // Variable-length mode
             q_row_offset = params.cu_seqlens_q[batch_idx];
             k_row_offset = params.cu_seqlens_k[batch_idx];
@@ -29,47 +31,74 @@ class Context {
         }
     }
 
-    __device__ size_t get_q_gmem_offset(const ForwardParams& params, int batch_idx, int head_idx, int block_m_idx) const {
-        if (params.cu_seqlens_q) {
+    __device__ Element* get_q_gmem_ptr(const ForwardParams& params, int batch_idx, int head_idx, int block_m_idx) const {
+        size_t offset;
+        if constexpr (KernelTraits::is_varlen) {
             // In varlen mode, data is [total_tokens, heads, dim]
-            return (q_row_offset + block_m_idx * KernelTraits::kBlockM) * params.q_row_stride
+            offset = (q_row_offset + block_m_idx * KernelTraits::kBlockM) * params.q_row_stride
                    + head_idx * params.q_head_stride;
         } else {
-            return batch_idx * params.q_batch_stride + head_idx * params.q_head_stride
+            offset = batch_idx * params.q_batch_stride + head_idx * params.q_head_stride
                    + block_m_idx * KernelTraits::kBlockM * params.q_row_stride;
         }
+        return static_cast<Element*>(params.q_ptr) + offset;
     }
 
-    __device__ size_t get_k_gmem_offset(const ForwardParams& params, int batch_idx, int head_idx, int block_n_idx) const {
-        head_idx = head_idx / params.kv_group_size;
-        if (params.cu_seqlens_k) {
-            return (k_row_offset + block_n_idx * KernelTraits::kBlockN) * params.k_row_stride
-                   + head_idx * params.k_head_stride;
+    __device__ Element* get_k_gmem_ptr(const ForwardParams& params, int batch_idx, int head_idx, int block_n_idx) const {
+        const int kv_head_idx = head_idx / params.kv_group_size;
+        size_t offset;
+        if constexpr (KernelTraits::is_varlen) {
+            if (params.block_table) {
+                const int* block_table_ptr = static_cast<const int*>(params.block_table) + batch_idx * params.block_table_batch_stride;
+                const int block_table_idx = block_n_idx * KernelTraits::kBlockN / params.page_block_size;
+                const int block_table_offset = block_n_idx * KernelTraits::kBlockN - block_table_idx * params.page_block_size;
+                offset = block_table_ptr[block_table_idx] * params.k_cache_block_stride + block_table_offset * params.k_row_stride
+                    + kv_head_idx * params.k_head_stride;
+            } else {
+                offset = (k_row_offset + block_n_idx * KernelTraits::kBlockN) * params.k_row_stride
+                   + kv_head_idx * params.k_head_stride;
+            }
         } else {
-            return batch_idx * params.k_batch_stride + head_idx * params.k_head_stride
-                   + block_n_idx * KernelTraits::kBlockN * params.k_row_stride;
+            // Standard fixed-length mode
+            offset = batch_idx * params.k_batch_stride + kv_head_idx * params.k_head_stride
+                    + block_n_idx * KernelTraits::kBlockN * params.k_row_stride;
         }
+        return static_cast<Element*>(params.k_ptr) + offset;
     }
 
-    __device__ size_t get_v_gmem_offset(const ForwardParams& params, int batch_idx, int head_idx, int block_n_idx) const {
-        head_idx = head_idx / params.kv_group_size;
-        if (params.cu_seqlens_k) {
-            return (k_row_offset + block_n_idx * KernelTraits::kBlockN) * params.v_row_stride
-                   + head_idx * params.v_head_stride;
+    __device__ Element* get_v_gmem_ptr(const ForwardParams& params, int batch_idx, int head_idx, int block_n_idx) const {
+        const int kv_head_idx = head_idx / params.kv_group_size;
+        size_t offset;
+        if constexpr (KernelTraits::is_varlen) {
+            if (params.block_table) {
+                const int* block_table_ptr = static_cast<const int*>(params.block_table) + batch_idx * params.block_table_batch_stride;
+                const int block_table_idx = block_n_idx * KernelTraits::kBlockN / params.page_block_size;
+                const int block_table_offset = block_n_idx * KernelTraits::kBlockN - block_table_idx * params.page_block_size;
+                offset = block_table_ptr[block_table_idx] * params.v_cache_block_stride + block_table_offset * params.v_row_stride
+                    + kv_head_idx * params.v_head_stride;
+            } else {
+                // In varlen mode, data is [total_tokens, kv_heads, dim]
+                offset = (k_row_offset + block_n_idx * KernelTraits::kBlockN) * params.v_row_stride
+                   + kv_head_idx * params.v_head_stride;
+            }
         } else {
-            return batch_idx * params.v_batch_stride + head_idx * params.v_head_stride
-                   + block_n_idx * KernelTraits::kBlockN * params.v_row_stride;
+            // Standard fixed-length mode
+            offset = batch_idx * params.v_batch_stride + kv_head_idx * params.v_head_stride
+                    + block_n_idx * KernelTraits::kBlockN * params.v_row_stride;
         }
+        return static_cast<Element*>(params.v_ptr) + offset;
     }
 
-    __device__ size_t get_o_gmem_offset(const ForwardParams& params, int batch_idx, int head_idx, int block_m_idx) const {
+    __device__ Element* get_o_gmem_ptr(const ForwardParams& params, int batch_idx, int head_idx, int block_m_idx) const {
+        size_t offset;
         if (params.cu_seqlens_q) {
-            return (q_row_offset + block_m_idx * KernelTraits::kBlockM) * params.o_row_stride
+            offset = (q_row_offset + block_m_idx * KernelTraits::kBlockM) * params.o_row_stride
                    + head_idx * params.o_head_stride;
         } else {
-            return batch_idx * params.o_batch_stride + head_idx * params.o_head_stride
+            offset = batch_idx * params.o_batch_stride + head_idx * params.o_head_stride
                    + block_m_idx * KernelTraits::kBlockM * params.o_row_stride;
         }
+        return static_cast<Element*>(params.o_ptr) + offset;
     }
 
     int actual_seqlen_q;
@@ -98,8 +127,7 @@ class Query {
     using GmemTensor = decltype(make_tensor(make_gmem_ptr<Element>(nullptr), GmemLayout{}));
 
     explicit __device__ Query(const Context<KernelTraits>& ctx, const ForwardParams& params, Element* smem) {
-        const size_t offset = ctx.get_q_gmem_offset(params, blockIdx.z, blockIdx.y, blockIdx.x);
-        auto gmem_ptr = static_cast<Element*>(params.q_ptr) + offset;
+        auto gmem_ptr = ctx.get_q_gmem_ptr(params, blockIdx.z, blockIdx.y, blockIdx.x);
         const auto layout = make_layout(GmemShape{}, make_stride(params.q_row_stride, _1{}));
         gmem_ = make_tensor(make_gmem_ptr<Element>(gmem_ptr), layout);
 
@@ -155,9 +183,7 @@ class Key {
     using GmemTensor = decltype(make_tensor(make_gmem_ptr<Element>(nullptr), make_layout(GmemShape{}, GmemStride{})));
 
     explicit __device__ Key(const Context<KernelTraits>& ctx, const ForwardParams& params, Element* smem) {
-        const size_t offset = ctx.get_k_gmem_offset(params, blockIdx.z, blockIdx.y, 0);
-
-        auto gmem_ptr = static_cast<Element*>(params.k_ptr) + offset;
+        auto gmem_ptr = ctx.get_k_gmem_ptr(params, blockIdx.z, blockIdx.y, 0);
         const auto layout = make_layout(GmemShape{}, make_stride(params.k_row_stride, _1{}));
         gmem_ = make_tensor(make_gmem_ptr<Element>(gmem_ptr), layout);
 
@@ -197,8 +223,7 @@ class Key {
 
  private:
     __forceinline__ __device__ void set_gmem_address(const Context<KernelTraits>& ctx, const ForwardParams& params, int nbidx) {
-        const size_t offset = ctx.get_k_gmem_offset(params, blockIdx.z, blockIdx.y, nbidx);
-        auto gmem_ptr = static_cast<Element*>(params.k_ptr) + offset;
+        auto gmem_ptr = ctx.get_k_gmem_ptr(params, blockIdx.z, blockIdx.y, nbidx);
         gmem_ = make_tensor(make_gmem_ptr<Element>(gmem_ptr), gmem_.layout());
     }
 
@@ -218,8 +243,7 @@ struct Value {
     using GmemTensor = Key<KernelTraits>::GmemTensor;
 
     __device__ explicit Value(const Context<KernelTraits>& ctx, const ForwardParams& params, Element* smem) {
-        const index_t offset = ctx.get_v_gmem_offset(params, blockIdx.z, blockIdx.y, 0);
-        auto gmem_ptr = static_cast<Element*>(params.v_ptr) + offset;
+        auto gmem_ptr = ctx.get_v_gmem_ptr(params, blockIdx.z, blockIdx.y, 0);
         const auto layout = make_layout(GmemShape{}, make_stride(params.v_row_stride, _1{}));
         gmem_ = make_tensor(make_gmem_ptr<Element>(gmem_ptr), layout);
 
@@ -260,8 +284,7 @@ struct Value {
  private:
 
     __forceinline__ __device__ void set_gmem_address(const Context<KernelTraits>& ctx, const ForwardParams& params, int nbidx) {
-        const size_t offset = ctx.get_v_gmem_offset(params, blockIdx.z, blockIdx.y, nbidx);
-        auto gmem_ptr = static_cast<Element*>(params.v_ptr) + offset;
+        auto gmem_ptr = ctx.get_v_gmem_ptr(params, blockIdx.z, blockIdx.y, nbidx);
         gmem_ = make_tensor(make_gmem_ptr<Element>(gmem_ptr), gmem_.layout());
     }
 
@@ -511,8 +534,7 @@ struct Output {
         rmem_ = make_tensor<ElementAccum>(RmemLayout{});
         cute::fill(rmem_, .0f);
 
-        const index_t offset = ctx.get_o_gmem_offset(params, blockIdx.z, blockIdx.y, blockIdx.x);
-        auto gmem_ptr = static_cast<Element*>(params.o_ptr) + offset;
+        auto gmem_ptr = ctx.get_o_gmem_ptr(params, blockIdx.z, blockIdx.y, blockIdx.x);
         auto layout = make_layout(GmemShape{}, make_stride(params.o_row_stride, _1{}));
         gmem_ = make_tensor(make_gmem_ptr(gmem_ptr), layout);
 

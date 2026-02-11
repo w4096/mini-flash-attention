@@ -74,7 +74,7 @@ Here are the results for a forward pass with `batch_size=10`, `seqlen=4096`, `di
 | Implementation | CPU Time | CUDA Time |
 |----------------|----------|-----------|
 | **Mini Flash Attention** | 41.606ms | **41.547ms** |
-| PyTorch Attention | 44.098ms | 42.882ms |
+| PyTorch (scaled_dot_product_attention) | 44.098ms | 42.882ms |
 | Flash Attention (official) | 43.890ms | 42.692ms |
 
 All implementations produce nearly identical results:

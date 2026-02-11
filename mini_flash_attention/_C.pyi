@@ -24,7 +24,8 @@ def mini_flash_attention_varlen_forward(
     max_seqlen_k: int,
     causal: bool,
     window_size_left: int,
-    window_size_right: int
+    window_size_right: int,
+    block_table: Optional[torch.Tensor],
 ) -> torch.Tensor:
     ...
     
@@ -35,6 +36,6 @@ def mini_flash_attention_with_kvcache(
     cache_seqlens: Optional[Union[int, torch.Tensor]],
     block_table: Optional[torch.Tensor],
     causal: bool,
-    num_splits: int,
+    num_splits: int = 0,
 ) -> torch.Tensor:
     ...

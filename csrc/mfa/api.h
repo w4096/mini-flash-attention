@@ -25,7 +25,9 @@ at::Tensor flash_attention_varlen_forward(
     const int max_seqlen_k,
     bool is_causal,
     int window_size_left,
-    int window_size_right);
+    int window_size_right,
+    const std::optional<torch::Tensor>& block_table_
+);
 
 
 at::Tensor mha_fwd_kvcache(

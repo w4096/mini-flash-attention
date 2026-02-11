@@ -101,79 +101,6 @@ void forward_params_init(ForwardParams& params,
 }
 
 
-static int num_splits_heuristic(int batch_nheads, int num_n_blocks, int max_splits) {
-    int device;
-    CHECK_CUDA(cudaGetDevice(&device));
-    int num_SMs;
-    CHECK_CUDA(cudaDeviceGetAttribute(&num_SMs, cudaDevAttrMultiProcessorCount, device));
-    num_SMs *= 2;
-
-    if (batch_nheads * 100 > num_SMs * 80) {
-        return 1;
-    }
-
-    auto ceildiv = [](int a, int b) { return (a + b - 1) / b; };
-    max_splits = std::min({max_splits, num_SMs, num_n_blocks});
-
-    float max_efficiency = 0.0f;
-    int max_efficiency_splits = 1;
-    for (int splits = 1; splits <= max_splits; splits ++) {
-        if (splits > 1 && ceildiv(num_n_blocks, splits) == ceildiv(num_n_blocks, splits - 1)) {
-            continue;
-        }
-
-        float n_waves = static_cast<float>(batch_nheads * splits) / num_SMs;
-        float efficiency = n_waves / std::ceil(n_waves);
-        if (efficiency > 0.9) {
-            return splits;
-        }
-        if (efficiency > max_efficiency) {
-            max_efficiency = efficiency;
-            max_efficiency_splits = splits;
-        }
-    }
-
-    return max_efficiency_splits;
-}
-
-
-std::tuple<at::Tensor, at::Tensor> forward_params_set_split_kv(
-    ForwardParams& params,
-    const int batch,
-    const int heads,
-    const int head_dim,
-    const int max_seqlen_k,
-    const int max_seqlen_q,
-    const int num_splits,
-    const at::TensorOptions& opts
-) {
-    const int block_n = 64;
-    const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
-
-    params.num_splits = num_splits;
-
-    if (num_splits < 1) {
-        params.num_splits = num_splits_heuristic(batch * heads, num_n_blocks, 128);
-    }
-    
-    // Ensure num_splits doesn't exceed the number of blocks
-    if (params.num_splits > num_n_blocks) {
-        params.num_splits = num_n_blocks;
-    }
-
-    at::Tensor softmax_lse_accum;
-    at::Tensor out_accum;
-
-    if (params.num_splits > 1) {
-        softmax_lse_accum = torch::full({params.num_splits, batch, heads}, -std::numeric_limits<float>::infinity(), opts.dtype(at::kFloat));
-        out_accum = torch::zeros({params.num_splits, batch, heads, head_dim}, opts.dtype(at::kFloat));
-        params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
-        params.oaccum_ptr = out_accum.data_ptr();
-    }
-
-    return {softmax_lse_accum, out_accum};
-}
-
 /**
  * Flash Attention v2 forward
  *
@@ -261,15 +188,16 @@ at::Tensor flash_attention_forward(
 
 at::Tensor flash_attention_varlen_forward(
     const torch::Tensor& q,  // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
-    const torch::Tensor& k,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
-    const torch::Tensor& v,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b}
+    const torch::Tensor& k,  // total_k x num_heads_k x head_size 
+    const torch::Tensor& v,  // total_k x num_heads_k x head_size
     const torch::Tensor& cu_seqlens_q,
     const torch::Tensor& cu_seqlens_k,
     const int max_seqlen_q,
     const int max_seqlen_k,
     bool is_causal,
     int window_size_left,
-    int window_size_right
+    int window_size_right,
+    const std::optional<torch::Tensor>& block_table_
 ){
     torch::cuda::CUDAGuard guard(q.device());
 
@@ -285,14 +213,20 @@ at::Tensor flash_attention_varlen_forward(
     CHECK_DEVICE(cu_seqlens_q);
     CHECK_DEVICE(cu_seqlens_k);
 
-    torch::Tensor out = torch::empty_like(q);
 
     const auto sizes = q.sizes();
-    const int batch = cu_seqlens_q.numel() - 1;
+    const int total_q_len = sizes[0];
+    const int batch = cu_seqlens_q.numel() - 1;  // number of sequences
     const int num_heads = sizes[1];
     const int head_dim = sizes[2];
-    const int kv_num_heads = k.size(1);
+
+    
+    const int kv_num_heads = k.size(-2);
+    TORCH_CHECK(head_dim <= 256, "head dimension must be less than or equal to 256");
     TORCH_CHECK(num_heads % kv_num_heads == 0, "number of key/value heads must be divisible by number of query heads");
+
+
+    torch::Tensor out = torch::empty_like(q);
 
     if (is_causal) { window_size_right = 0; }
 
@@ -304,10 +238,105 @@ at::Tensor flash_attention_varlen_forward(
         window_size_left, window_size_right
     );
 
+    CHECK_SHAPE(q, total_q_len, num_heads, head_dim);
+    if (block_table_.has_value()) {
+        const int num_blocks = k.size(0);
+        const int page_block_size = k.size(1);
+
+        CHECK_SHAPE(k, num_blocks, page_block_size, kv_num_heads, head_dim);
+        CHECK_SHAPE(v, num_blocks, page_block_size, kv_num_heads, head_dim);
+        
+        auto block_table = block_table_.value();
+        CHECK_DEVICE(block_table);
+        TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must be int32");
+        TORCH_CHECK(block_table.size(0) == batch, "block_table must have the same batch size as q");
+        params.block_table = block_table.data_ptr<int>();
+        params.block_table_batch_stride = block_table.stride(0);
+        params.page_block_size = page_block_size;
+        params.k_cache_block_stride = k.stride(0);
+        params.v_cache_block_stride = v.stride(0);
+    } else {
+        CHECK_SHAPE(k, total_q_len, kv_num_heads, head_dim);
+        CHECK_SHAPE(v, total_q_len, kv_num_heads, head_dim);
+    }
+
     auto stream = torch::cuda::getCurrentCUDAStream();
     run_flash_attention_forward(params, stream);
 
     return out;
+}
+
+static int num_splits_heuristic(int batch_nheads, int num_n_blocks, int max_splits) {
+    int device;
+    CHECK_CUDA(cudaGetDevice(&device));
+    int num_SMs;
+    CHECK_CUDA(cudaDeviceGetAttribute(&num_SMs, cudaDevAttrMultiProcessorCount, device));
+    num_SMs *= 2;
+
+    if (batch_nheads * 100 > num_SMs * 80) {
+        return 1;
+    }
+
+    auto ceildiv = [](int a, int b) { return (a + b - 1) / b; };
+    max_splits = std::min({max_splits, num_SMs, num_n_blocks});
+
+    float max_efficiency = 0.0f;
+    int max_efficiency_splits = 1;
+    for (int splits = 1; splits <= max_splits; splits ++) {
+        if (splits > 1 && ceildiv(num_n_blocks, splits) == ceildiv(num_n_blocks, splits - 1)) {
+            continue;
+        }
+
+        float n_waves = static_cast<float>(batch_nheads * splits) / num_SMs;
+        float efficiency = n_waves / std::ceil(n_waves);
+        if (efficiency > 0.9) {
+            return splits;
+        }
+        if (efficiency > max_efficiency) {
+            max_efficiency = efficiency;
+            max_efficiency_splits = splits;
+        }
+    }
+
+    return max_efficiency_splits;
+}
+
+
+std::tuple<at::Tensor, at::Tensor> forward_params_set_split_kv(
+    ForwardParams& params,
+    const int batch,
+    const int heads,
+    const int head_dim,
+    const int max_seqlen_k,
+    const int max_seqlen_q,
+    const int num_splits,
+    const at::TensorOptions& opts
+) {
+    const int block_n = 64;
+    const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
+
+    params.num_splits = num_splits;
+
+    if (num_splits < 1) {
+        params.num_splits = num_splits_heuristic(batch * heads, num_n_blocks, 128);
+    }
+    
+    // Ensure num_splits doesn't exceed the number of blocks
+    if (params.num_splits > num_n_blocks) {
+        params.num_splits = num_n_blocks;
+    }
+
+    at::Tensor softmax_lse_accum;
+    at::Tensor out_accum;
+
+    if (params.num_splits > 1) {
+        softmax_lse_accum = torch::full({params.num_splits, batch, heads}, -std::numeric_limits<float>::infinity(), opts.dtype(at::kFloat));
+        out_accum = torch::zeros({params.num_splits, batch, heads, head_dim}, opts.dtype(at::kFloat));
+        params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
+        params.oaccum_ptr = out_accum.data_ptr();
+    }
+
+    return {softmax_lse_accum, out_accum};
 }
 
 
@@ -338,13 +367,7 @@ at::Tensor mha_fwd_kvcache(
     TORCH_CHECK(v_cache.stride(-1) == 1, "Input tensor must have contiguous last dimension");
 
     torch::Tensor block_table;
-    bool paged_kv = block_table_.has_value();
-    if (paged_kv) {
-        block_table = block_table_.value();
-        CHECK_DEVICE(block_table);
-        TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must be int32");
-    }
-
+    
     const auto sizes = q.sizes();
     const int batch = sizes[0];
     const int seqlen_q = sizes[1];
@@ -352,21 +375,29 @@ at::Tensor mha_fwd_kvcache(
     const int head_dim = sizes[3];
 
     TORCH_CHECK(seqlen_q == 1, "flash decoding expects seqlen_q == 1, got ", seqlen_q);
-
-    const int max_num_blocks_per_seq = !paged_kv ? 0 : block_table.size(1);
-    const int num_blocks = !paged_kv ? 0 : k_cache.size(0);
-    const int page_block_size = !paged_kv ? 1 : k_cache.size(1);
-    const int seqlen_k = paged_kv ? max_num_blocks_per_seq * page_block_size : k_cache.size(1);
-    const int kv_num_heads = k_cache.size(2);
+    
+    bool paged_kv = block_table_.has_value();
+    int seqlen_k;
+    const int kv_num_heads = k_cache.size(-2);
     TORCH_CHECK(head_dim <= 256, "head dimension must be less than or equal to 256");
     TORCH_CHECK(num_heads % kv_num_heads == 0, "number of key/value heads must be divisible by number of query heads");
 
 
     CHECK_SHAPE(q, batch, seqlen_q, num_heads, head_dim);
     if (paged_kv) {
+        block_table = block_table_.value();
+        CHECK_DEVICE(block_table);
+        TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must be int32");
+
+        const int max_num_blocks_per_seq = block_table.size(1);
+        const int page_block_size = k_cache.size(1);
+        seqlen_k = max_num_blocks_per_seq * page_block_size;
+        const int num_blocks = k_cache.size(0);
+
         CHECK_SHAPE(k_cache, num_blocks, page_block_size, kv_num_heads, head_dim);
         CHECK_SHAPE(v_cache, num_blocks, page_block_size, kv_num_heads, head_dim);
     } else {
+        seqlen_k = k_cache.size(1);
         CHECK_SHAPE(k_cache, batch, seqlen_k, kv_num_heads, head_dim);
         CHECK_SHAPE(v_cache, batch, seqlen_k, kv_num_heads, head_dim);
     }
@@ -381,14 +412,16 @@ at::Tensor mha_fwd_kvcache(
         -1, -1
     );
 
-    if (block_table_.has_value()) {
-        auto block_table = block_table_.value();
+    if (paged_kv) {
         CHECK_DEVICE(block_table);
         TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must be int32");
         TORCH_CHECK(block_table.size(0) == batch, "block_table must have the same batch size as q");
         params.block_table = block_table.data_ptr<int>();
         params.block_table_batch_stride = block_table.stride(0);
+        const int page_block_size = k_cache.size(1);
         params.page_block_size = page_block_size;
+        params.k_cache_block_stride = k_cache.stride(0);
+        params.v_cache_block_stride = v_cache.stride(0);
     }
 
     if (seqlens_k_.has_value()) {

@@ -8,4 +8,4 @@ ncu \
   --warp-sampling-max-passes 1000 \
   --warp-sampling-buffer-size 536870912 \
   --set full \
-  python benchmark/run.py
+  python benchmark/prefill.py
