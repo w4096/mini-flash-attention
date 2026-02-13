@@ -135,7 +135,7 @@ class Query {
         smem_ = make_tensor(make_smem_ptr(smem), SmemLayout{});
     }
 
-    __device__ void copy_gmem_to_smem(const Context<KernelTraits>& ctx, const ForwardParams& params) {
+    __device__ void copy_gmem_to_smem(const Context<KernelTraits>& ctx) {
         const int row_offset = blockIdx.x * KernelTraits::kBlockM;
         const int max_row = ctx.actual_seqlen_q;
         
@@ -611,7 +611,7 @@ struct Output {
         }
     }
 
-    __device__ void copy_smem_to_gmem(const Context<KernelTraits>& ctx, const ForwardParams& params) {
+    __device__ void copy_smem_to_gmem(const Context<KernelTraits>& ctx) {
         const int max_row = ctx.actual_seqlen_q;
         const int block_row_offset = blockIdx.x * KernelTraits::kBlockM;
         
@@ -709,7 +709,7 @@ struct Output {
 }
 
 template<typename KernelTraits>
-__global__ __launch_bounds__(128, 4) void flash_attention_fwd_kernel(__grid_constant__ const ForwardParams params) {
+__global__ void flash_attention_fwd_kernel(__grid_constant__ const ForwardParams params) {
     using Element = KernelTraits::Element;
     using namespace prefill;
 
@@ -752,7 +752,7 @@ __global__ __launch_bounds__(128, 4) void flash_attention_fwd_kernel(__grid_cons
         : n_blocks;
 
 
-    Q.copy_gmem_to_smem(ctx, params);
+    Q.copy_gmem_to_smem(ctx);
     K.copy_gmem_to_smem(ctx, params, n_block_min);
     cute::cp_async_fence();
 
@@ -799,7 +799,7 @@ __global__ __launch_bounds__(128, 4) void flash_attention_fwd_kernel(__grid_cons
     // Ensure all threads have written to shared memory before reading
     __syncthreads();
         
-    O.copy_smem_to_gmem(ctx, params);
+    O.copy_smem_to_gmem(ctx);
 }
 
 } // namespace mfa

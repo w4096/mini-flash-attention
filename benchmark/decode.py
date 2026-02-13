@@ -1,6 +1,5 @@
 import torch
 from mini_flash_attention import flash_attn_func, flash_attn_with_kvcache
-
 from flash_attn import flash_attn_with_kvcache as flash_attn_with_kvcache_reference
 
 
@@ -8,28 +7,27 @@ device = torch.device("cuda:0")
 dtype = torch.float16
 
 head_dim = 128
-batch_size = 92
+batch_size = 96
 seqlen_q = 1  # Decoding: one token at a time
 seqlen_kv = 4096
 num_heads = 48
-block_size = 64
-num_blocks = 4
 
 # Query: (batch_size, 1, nheads, headdim)
 q = torch.randn(batch_size, seqlen_q, num_heads, head_dim, device=device, dtype=dtype)
 
-# KV cache: (num_blocks, block_size, nheads, headdim)
 k_cache = torch.randn(batch_size, seqlen_kv, num_heads, head_dim, device=device, dtype=dtype)
 v_cache = torch.randn(batch_size, seqlen_kv, num_heads, head_dim, device=device, dtype=dtype)
 
-
 cache_seqlens = torch.tensor([seqlen_kv] * batch_size, dtype=torch.int32, device=device)
+
+for _ in range(3):
+    flash_attn_with_kvcache(q, k_cache, v_cache, cache_seqlens=cache_seqlens)
+    flash_attn_with_kvcache_reference(q, k_cache, v_cache, cache_seqlens=cache_seqlens)
 
 with torch.profiler.profile() as prof:
     output = flash_attn_with_kvcache(
         q, k_cache, v_cache,
         cache_seqlens=cache_seqlens,
-        causal=False,
     )
 key_averages = prof.key_averages()
 print("Mini Flash Attention with KV Cache Profiling Results:")
@@ -43,7 +41,6 @@ with torch.profiler.profile() as prof:
     flash_attn_out, lse = flash_attn_with_kvcache_reference(
         q, k_cache, v_cache,
         cache_seqlens=cache_seqlens,
-        causal=False,
         return_softmax_lse=True
     )
 

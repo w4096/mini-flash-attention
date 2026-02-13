@@ -22,7 +22,7 @@ def mini_flash_attention(q, k, v, causal=False):
 def test_flash_attn_forward():
 
     # Define input parameters
-    batch_size = 4
+    batch_size = 48
     seqlen = 4096
     dim = 128
     heads = 24
@@ -47,9 +47,12 @@ def test_flash_attn_forward():
         flash_attention(q, k, v, causal=is_causal)
 
 
-
+    with torch.profiler.profile() as prof:
+        mini_flash_attn_out = mini_flash_attention(q, k, v, causal=is_causal)
+    key_averages = prof.key_averages()
+    print("Mini Flash Attention Profiling Results:")
+    print(key_averages.table(sort_by="cuda_time_total", row_limit=10))
     
-
     with torch.profiler.profile() as prof:
         torch_out = torch_attention(q, k, v, causal=is_causal)
     key_averages = prof.key_averages()
@@ -60,15 +63,9 @@ def test_flash_attn_forward():
         flash_attn_out = flash_attention(q, k, v, causal=is_causal)
     key_averages = prof.key_averages()
     print("Flash Attention Profiling Results:")
-    print(key_averages.table(sort_by="cuda_time_total", row_limit=10))
-    
-    with torch.profiler.profile() as prof:
-        mini_flash_attn_out = mini_flash_attention(q, k, v, causal=is_causal)
-    key_averages = prof.key_averages()
-    print("Mini Flash Attention Profiling Results:")
-    print(key_averages.table(sort_by="cuda_time_total", row_limit=10))
-    
-    
+    print(key_averages.table(sort_by="cuda_time_total", row_limit=10))    
+
+
 
     print("shape:", mini_flash_attn_out.shape, flash_attn_out.shape, torch_out.shape)
 

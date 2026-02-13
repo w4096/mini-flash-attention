@@ -331,7 +331,7 @@ std::tuple<at::Tensor, at::Tensor> forward_params_set_split_kv(
 
     if (params.num_splits > 1) {
         softmax_lse_accum = torch::full({params.num_splits, batch, heads}, -std::numeric_limits<float>::infinity(), opts.dtype(at::kFloat));
-        out_accum = torch::zeros({params.num_splits, batch, heads, head_dim}, opts.dtype(at::kFloat));
+        out_accum = torch::empty({params.num_splits, batch, heads, head_dim}, opts.dtype(at::kFloat));
         params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
         params.oaccum_ptr = out_accum.data_ptr();
     }

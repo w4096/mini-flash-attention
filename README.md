@@ -1,6 +1,6 @@
 # Mini Flash Attention
 
-A minimal, educational implementation of Flash Attention v2 in CUDA. This project demonstrates the core concepts of Flash Attention with a focus on code clarity and understanding. Currently, it only supports forward pass with causal masking and variable-length sequences.
+A minimal, educational implementation of Flash Attention v2 in CUDA. This project demonstrates the core concepts of Flash Attention with a focus on code clarity and understanding. 
 
 [mini-flash-attention v0.1](https://github.com/w4096/mini-flash-attention/tree/v0.1) is a simplified version that omits some advanced features like causal masking and variable-length sequences. If you are not familiar with Flash Attention, start with this version to grasp the fundamentals.
 
@@ -9,11 +9,13 @@ A minimal, educational implementation of Flash Attention v2 in CUDA. This projec
 Flash Attention is a fast and memory-efficient attention algorithm that makes training large models more practical. This is a simplified version that keeps the core ideas while being easier to understand and modify.
 
 **Key features:**
+
 - Flash Attention v2 algorithm with tiling
 - CUDA Tensor Cores for matrix operations
 - FP16 and BF16 support
 - Variable-length sequences (continuous batching)
-- Works seamlessly with PyTorch
+- Causal masking
+- Flash decoding
 
 ## Getting Started
 
@@ -67,49 +69,76 @@ output = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max(seqlens), m
 
 ## Performance
 
-Benchmarked on NVIDIA GPU by running the benchmark script in `benchmark/run.py`.
+Benchmarked on an NVIDIA RTX 5070 with CUDA 12.8 using the scripts in `benchmark`. Results can vary across hardware and software.
 
-Here are the results for a forward pass with `batch_size=10`, `seqlen=4096`, `dim=128`, and `heads=28`:
+Prefill (seq length 4096, batch 48, heads 24, head dim 128):
 
-| Implementation | CPU Time | CUDA Time |
-|----------------|----------|-----------|
-| **Mini Flash Attention** | 41.606ms | **41.547ms** |
-| PyTorch (scaled_dot_product_attention) | 44.098ms | 42.882ms |
-| Flash Attention (official) | 43.890ms | 42.692ms |
+| Implementation | CUDA Time |
+|---|---|
+| Mini Flash Attention | 163.380ms |
+| PyTorch (scaled_dot_product_attention) | 165.238ms |
+| Flash Attention (official) | 161.816ms |
 
-All implementations produce nearly identical results:
+Decoding (head_dim=128, batch_size=96, seqlen_q=1, seqlen_kv=4096, num_heads=48):
 
+| Implementation | CUDA Time |
+|---|---|
+| Mini Flash Attention | 15.106ms |
+| Flash Attention (official) | 22.067ms |
+
+
+Run the scripts in `benchmark` to test on your machine.
+
+## API
+
+The API is same as the official Flash Attention implementation, with two three functions:
+
+1. Standard batched attention. Supports optional causal masking.
+
+```python
+def flash_attn_func(
+    q: torch.Tensor,
+    k: torch.Tensor, 
+    v: torch.Tensor,
+    causal: bool = False,
+) -> torch.Tensor:
 ```
-Max difference between mini-flash-attn and flash-attn: 3.814697265625e-06
-Max difference between torch and flash-attn: 3.814697265625e-06
-Max difference between torch and mini-flash-attn: 3.814697265625e-06
+
+2. Variable-length sequences (continuous batching). Supports optional causal masking and block table.
+
+```python
+def flash_attn_varlen_func(
+    q: torch.Tensor,
+    k: torch.Tensor, 
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    causal: bool = False,
+    block_table=None,
+) -> torch.Tensor:
 ```
 
-Run `python benchmark/run.py` to test on your hardware.
+3. Flash decoding with KV cache.
 
-## How It Works
-
-The implementation splits Q, K, V into tiles and processes them in chunks:
-
-1. Load a tile of Q into shared memory
-2. Loop through K/V tiles, computing attention scores incrementally  
-3. Use online softmax to maintain numerical stability
-4. Accumulate the output on-the-fly
-
-This approach keeps memory usage low while being fast thanks to:
-
-- CUDA Tensor Cores for matrix multiplications
-- Shared memory tiling to reduce bandwidth
-- Async memory copies to overlap computation
-- Swizzled memory layouts to avoid bank conflicts
-
-The code uses NVIDIA CuTe library for clean tensor operations.
+```python
+def flash_attn_with_kvcache(
+    q,
+    k_cache,
+    v_cache,
+    cache_seqlens: Optional[Union[int, torch.Tensor]] = None,
+    block_table: Optional[torch.Tensor] = None,
+    num_splits=0,
+) -> torch.Tensor:
+```
 
 ## What's Next
 
 - [x] Implement causal masking
 - [x] Support variable sequence lengths
 - [x] Support KV cache
+- [ ] sliding window attention
 
 ## References
 
