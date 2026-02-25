@@ -709,7 +709,7 @@ struct Output {
 }
 
 template<typename KernelTraits>
-__global__ void flash_attention_fwd_kernel(__grid_constant__ const ForwardParams params) {
+__global__ __launch_bounds__(128) void flash_attention_fwd_kernel(__grid_constant__ const ForwardParams params) {
     using Element = KernelTraits::Element;
     using namespace prefill;
 

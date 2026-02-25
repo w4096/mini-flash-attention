@@ -45,8 +45,6 @@ struct ForwardKernelTraits {
             cute::Swizzle<3, 3, 5>   // For head_dim>=256: row size >= 512 bytes
         >
     >;
-
-    static constexpr int smem_size = (kBlockM + 2 * kBlockN) * kHeadDim * sizeof(Element);
 };
 
 

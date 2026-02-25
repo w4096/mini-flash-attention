@@ -1,5 +1,5 @@
 import torch
-from mini_flash_attention import flash_attn_func, flash_attn_with_kvcache
+from mini_flash_attention import flash_attn_with_kvcache
 from flash_attn import flash_attn_with_kvcache as flash_attn_with_kvcache_reference
 
 

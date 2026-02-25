@@ -52,6 +52,7 @@ output = flash_attn_func(q, k, v, causal=True)
 ```
 
 For continuous batching (variable-length sequences):
+
 ```python
 from mini_flash_attention import flash_attn_varlen_func
 
@@ -69,25 +70,36 @@ output = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max(seqlens), m
 
 ## Performance
 
-Benchmarked on an NVIDIA RTX 5070 with CUDA 12.8 using the scripts in `benchmark`. Results can vary across hardware and software.
+Benchmarked on a NVIDIA RTX 5070 (sm_120) with CUDA 12.8 using the scripts in `benchmark`. Results can vary across hardware and software.
 
-Prefill (seq length 4096, batch 48, heads 24, head dim 128):
+Prefill (head_dim=128, batch_size=48, num_heads=24):
 
-| Implementation | CUDA Time |
-|---|---|
-| Mini Flash Attention | 163.380ms |
-| PyTorch (scaled_dot_product_attention) | 165.238ms |
-| Flash Attention (official) | 161.816ms |
+![](https://wangyu-name.oss-cn-hangzhou.aliyuncs.com/2025/12/dc40ef38.png)
 
-Decoding (head_dim=128, batch_size=96, seqlen_q=1, seqlen_kv=4096, num_heads=48):
-
-| Implementation | CUDA Time |
-|---|---|
-| Mini Flash Attention | 15.106ms |
-| Flash Attention (official) | 22.067ms |
+| Sequence Length | Mini Flash Attention | Official Flash Attention | Speedup |
+|:-----:|:-----:|:-----:|:-----:|
+|  256 | 0.665 ms | 0.779 ms | 1.173x |
+|  512 | 2.659 ms | 2.872 ms | 1.080x |
+| 1024 | 10.515 ms | 10.746 ms | 1.022x |
+| 2048 | 41.818 ms | 41.696 ms | 0.997x |
+| 4096 | 167.180 ms | 165.385 ms | 0.989x |
 
 
-Run the scripts in `benchmark` to test on your machine.
+Decoding (head_dim=128, batch_size=24, seqlen_q=1, num_heads=24):
+
+![](https://wangyu-name.oss-cn-hangzhou.aliyuncs.com/2025/12/886db7db.png)
+
+| KV Length | Mini Flash Attention | Official Flash Attention | Speedup |
+|:-----:|:-----:|:-----:|:-----:|
+|  512 | 0.246 ms | 0.340 ms | 1.383x |
+| 1024 | 0.484 ms | 0.645 ms | 1.334x |
+| 2048 | 0.963 ms | 1.259 ms | 1.307x |
+| 4096 | 1.915 ms | 2.547 ms | 1.330x |
+| 8192 | 3.907 ms | 5.023 ms | 1.285x |
+
+__Why is mini flash attention faster on decoding?__
+
+The mini flash attention only supports the query length of 1 in decoding, In the implementation, we can use vector-matrix multiplication instead of matrix-matrix multiplication. The official implementation supports arbitrary query lengths, if the query length is 1, it will still use matrix-matrix multiplication, which may introduce some overhead.
 
 ## API
 

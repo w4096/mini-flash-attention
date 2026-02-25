@@ -18,10 +18,12 @@ void run_mha_prefill(const ForwardParams& params, cudaStream_t stream) {
 
     auto kernel = flash_attention_fwd_kernel<KernelTraits>;
 
-    // Set shared memory limit for large head dimensions
-    // SM80 (Ampere) supports up to 164KB per SM, but 48KB per block by default
-    // For head_dim >= 128, we need more than 48KB
-    constexpr int smem_size = KernelTraits::smem_size;
+    using Element = typename KernelTraits::Element;
+    static const int kBlockN = KernelTraits::kBlockN;
+    static const int kHeadDim = KernelTraits::kHeadDim;
+    static const int kBlockM = KernelTraits::kBlockM;
+
+    const int smem_size = (kBlockM + 2 * kBlockN) * kHeadDim * sizeof(Element);
     if constexpr (smem_size > 48 * 1024) {
         cudaFuncSetAttribute(
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size
